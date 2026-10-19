@@ -162,9 +162,9 @@ def test_readme_screenshot_present():
 
 
 def test_concepts_table_names_exist(readme_parts):
-    """Function/class names in the 'ML techniques' table really exist in the named modules."""
+    """Function/class names in the repository-structure table really exist in the named modules."""
     _, _, tail = readme_parts
-    section = tail.split("## ML techniques")[1].split("\n## ")[0]
+    section = tail.split("## Repository structure")[1].split("\n## ")[0]
     rows = [r for r in section.splitlines() if "src/cinematch/" in r]
     assert len(rows) >= 6
     for row in rows:

@@ -575,96 +575,128 @@ def _ndcg(m: Any) -> Any:
     return (m or {}).get("ndcg_at_10")
 
 
-def _ranking_headlines(rm: dict) -> list[str]:
-    """Top-10 headline: item-kNN and MF + prior vs popularity (warm test users, then simulated new users)."""
-    out = []
+KEY_FIGURES = ("cf_training.png", "clusters_pca.png", "anomaly_scores.png", "bandit_regret.png")
+
+
+def _summary_rows(metrics: dict) -> list[tuple[str, str, str, str]]:
+    """(task, method, result, reference) rows for the summary table; each row only when its inputs exist."""
+    rm = metrics.get("rating_models") or {}
+    rows = []
+    mf, bias = rm.get("cf_mf") or {}, rm.get("bias_baseline") or {}
+    if mf.get("rmse") is not None and bias.get("rmse") is not None:
+        rows.append(("Rating prediction", "Matrix factorization", f"RMSE {fmt(mf['rmse'])}",
+                     f"bias baseline {fmt(bias['rmse'])}"))
+    rankers = [(name, _ndcg(rm.get(key))) for key, name in (("item_knn", "Item-kNN"),
+                                                             ("cf_mf_pop", "MF + popularity prior"))]
+    rankers = [(name, v) for name, v in rankers if v is not None]
     pop = _ndcg(rm.get("popularity"))
-    rivals = [("item-kNN", _ndcg(rm.get("item_knn"))), ("MF + popularity prior", _ndcg(rm.get("cf_mf_pop")))]
-    if pop is not None and any(v is not None for _, v in rivals):
-        rows = rivals + [("popularity", pop), ("MF ranked by its predicted rating", _ndcg(rm.get("cf_mf")))]
-        cells = ", ".join(f"{name} {fmt(v)}" for name, v in rows if v is not None)
-        out.append(f"**Top-10 ranking** (warm movies): NDCG@10 {cells}.")
+    if rankers and pop is not None:
+        best, value = max(rankers, key=lambda r: float(r[1]))
+        refs = [f"{name} {fmt(v)}" for name, v in rankers if name != best] + [f"popularity {fmt(pop)}"]
+        if _ndcg(rm.get("cf_mf")) is not None:
+            refs.append(f"MF ranked by predicted rating {fmt(_ndcg(rm['cf_mf']))}")
+        rows.append(("Top-10 ranking", best, f"NDCG@10 {fmt(value)}", "; ".join(refs)))
     nu = rm.get("new_users") or {}
     strategies = nu.get("strategies") or {}
     knn, npop = _ndcg(strategies.get("item_knn")), _ndcg(strategies.get("popularity"))
     if knn is not None and npop is not None:
-        out.append(f"**New users** (simulated, {nu.get('n_seed_ratings', 'n/a')} known ratings): item-kNN NDCG@10 "
-                   f"{fmt(knn)} vs {fmt(npop)} for popularity.")
-    return out
-
-
-def _headlines(metrics: dict) -> list[str]:
-    """The key numbers a reader should see first (each only when its inputs exist)."""
-    rm = metrics.get("rating_models") or {}
-    out = []
-    mf, bias = rm.get("cf_mf") or {}, rm.get("bias_baseline") or {}
-    if mf.get("rmse") is not None and bias.get("rmse") is not None:
-        out.append(f"**Rating prediction:** matrix factorization test RMSE {fmt(mf['rmse'])} vs {fmt(bias['rmse'])} "
-                   "for the bias baseline (lower is better).")
-    out += _ranking_headlines(rm)
-    cold = (rm.get("two_tower") or {}).get("cold") or {}
+        rows.append((f"New users ({nu.get('n_seed_ratings', 'n/a')} known ratings, simulated)", "Item-kNN",
+                     f"NDCG@10 {fmt(knn)}", f"popularity {fmt(npop)}"))
+    cold = _ndcg((rm.get("two_tower") or {}).get("cold"))
     baselines = rm.get("cold_baselines") or {}
-    rand, genre_pop = baselines.get("random") or {}, baselines.get("genre_popularity") or {}
-    if cold.get("ndcg_at_10") is not None and rand.get("ndcg_at_10") is not None:
-        text = (f"**Brand-new movies:** the two-tower model ranks them with NDCG@10 {fmt(cold['ndcg_at_10'])} vs "
-                f"{fmt(rand['ndcg_at_10'])} for random ranking")
-        if genre_pop.get("ndcg_at_10") is not None:
-            text += f" and {fmt(genre_pop['ndcg_at_10'])} for a non-personalized genre-popularity ranking"
-        out.append(text + ".")
+    rand, genre_pop = _ndcg(baselines.get("random")), _ndcg(baselines.get("genre_popularity"))
+    if cold is not None and rand is not None:
+        refs = ([f"genre popularity {fmt(genre_pop)}"] if genre_pop is not None else []) + [f"random {fmt(rand)}"]
+        rows.append(("Unseen movies (cold start)", "Two-tower content model", f"NDCG@10 {fmt(cold)}", "; ".join(refs)))
     a = metrics.get("anomaly") or {}
     if a.get("test_f1") is not None:
         per = {t: r for t, r in (a.get("per_bot_type_recall") or {}).items() if r is not None}
         missed = sum(float(r) < MISSED_RECALL for r in per.values())
-        miss_text = f"; misses {missed} of {len(per)} bot types" if per else ""
-        out.append(f"**Bot detection:** test F1 {fmt(a['test_f1'])} on synthetic bots (precision "
-                   f"{fmt(a.get('test_precision'))}, recall {fmt(a.get('test_recall'))}{miss_text}).")
+        rows.append(("Bot detection (synthetic bots)", "Gaussian density model",
+                     f"F1 {fmt(a['test_f1'])} (precision {fmt(a.get('test_precision'))}, "
+                     f"recall {fmt(a.get('test_recall'))})",
+                     f"misses {missed} of {len(per)} bot types" if per else "n/a"))
+    c = metrics.get("clustering") or {}
+    if c.get("silhouette") is not None:
+        rows.append(("Taste profiles", "K-means on MF user vectors",
+                     f"k = {c.get('k', 'n/a')}, silhouette {fmt(c['silhouette'])}", "low silhouette: coarse segments"))
     b = metrics.get("bandit") or {}
     pol = b.get("policies") or {}
     lin, rnd = pol.get("linucb") or {}, pol.get("random") or {}
     if lin.get("cum_regret") is not None and rnd.get("cum_regret"):
         drop = 100 * (1 - float(lin["cum_regret"]) / float(rnd["cum_regret"]))
-        text = (f"**Contextual bandit:** LinUCB's cumulative regret is {drop:.0f}% below random "
-                f"({fmt(lin['cum_regret'])} vs {fmt(rnd['cum_regret'])}, simulated clicks)")
-        if _context_pays_off(b) is False:
-            text += ", but it does not beat always serving the best single strategy"
-        out.append(text + ".")
-    if not out:
+        fixed = b.get("best_fixed_arm") or {}
+        pays_off = _context_pays_off(b)
+        if fixed.get("cum_regret") is not None:
+            suffix = "" if pays_off else " (not beaten)"
+            ref = f"best single strategy in hindsight {fmt(fixed['cum_regret'])}{suffix}"
+        else:
+            ref = {True: "beats the best single strategy", False: "not better than the best single strategy",
+                   None: "n/a"}[pays_off]
+        rows.append(("Strategy selection (simulated clicks)", "Contextual bandit (LinUCB)",
+                     f"regret {fmt(lin['cum_regret'])}, {drop:.0f}% below random ({fmt(rnd['cum_regret'])})", ref))
+    d = metrics.get("dqn") or {}
+    if d.get("dqn") is not None:
+        short = {"diversity_heuristic": "diversity heuristic", "greedy_cf": "CF order", "random": "random order"}
+        refs = [f"{short[key]} {fmt(d[key])}" for key, _ in DQN_RIVALS if d.get(key) is not None]
+        rows.append(("Session ordering (exploratory)", "Deep Q-network",
+                     f"{fmt(d['dqn'])} expected clicks per session", "; ".join(refs) or "n/a"))
+    return rows
+
+
+def _summary(metrics: dict) -> list[str]:
+    """Compact table with the key result of every component, shown before the detailed tables."""
+    rows = _summary_rows(metrics)
+    if not rows:
         return []
-    return ["**Headline results** (held-out data):", ""] + [f"- {t}" for t in out] + [""]
+    lines = ["**Summary** (held-out test data; full tables under *Detailed results*):", "",
+             "| Task | Method | Result | Reference |", "|---|---|---|---|"]
+    lines += [f"| {task} | {method} | {result} | {ref} |" for task, method, result, ref in rows]
+    return lines + [""]
 
 
 def render_results_markdown(metrics: dict) -> str:
-    """Render the full RESULTS block (markdown, without the markers)."""
+    """Render the full RESULTS block (markdown, without the markers): a summary table and the key
+    figures, then every detailed table, note and remaining figure in one collapsible section."""
     lines: list[str] = []
     if metrics.get("fast"):
         lines += ["> **FAST MODE — numbers not final.** Generated with `--fast`; rerun the full pipeline.", ""]
-    lines += _headlines(metrics)
-    lines += [_data_sentence(metrics), ""]
+    summary = _summary(metrics)
+    figs = _figures(metrics)
+    key_figs = [f for f in figs if f[1] in KEY_FIGURES] if summary else []
+    other_figs = [f for f in figs if f not in key_figs]
+    lines += summary
+    if key_figs:
+        lines += ["<p>"] + _figure_grid(key_figs) + ["</p>", ""]
+
     rm = metrics.get("rating_models") or {}
-    lines += _rating_section(rm)
+    detail = [_data_sentence(metrics), ""] + _rating_section(rm)
     new_users = _new_user_section(rm)
     if new_users:
-        lines += [""] + new_users
-    lines += [""] + _cold_section(rm)
-    lines += [""] + _anomaly_section(metrics.get("anomaly")) + [""]
-    lines += [_clustering_line(metrics.get("clustering")), ""]
-    lines += _bandit_section(metrics.get("bandit"))
-    lines += [""] + _dqn_section(metrics.get("dqn")) + [""]
-
-    details = _anomaly_details(metrics.get("anomaly")) + _bandit_details(metrics.get("bandit"))
-    if details:
-        lines += ["<details>", "<summary>Anomaly and bandit details</summary>", ""] + details + ["", "</details>", ""]
-
+        detail += [""] + new_users
+    detail += [""] + _cold_section(rm)
+    detail += [""] + _anomaly_section(metrics.get("anomaly")) + [""]
+    detail += [_clustering_line(metrics.get("clustering")), ""]
+    detail += _bandit_section(metrics.get("bandit"))
+    detail += [""] + _dqn_section(metrics.get("dqn")) + [""]
+    extra = _anomaly_details(metrics.get("anomaly")) + _bandit_details(metrics.get("bandit"))
+    if extra:
+        detail += ["**Further details:**", ""] + extra + [""]
     seconds = metrics.get("train_seconds") or {}
     done = {k: v for k, v in seconds.items() if v is not None}
     if done:
         steps = ", ".join(f"{k} {float(v):.0f}s" for k, v in done.items())
-        lines += [f"Training time: {sum(float(v) for v in done.values()):.0f}s, the sum of the step times ({steps}).",
-                  ""]
+        detail += [f"Training time: {sum(float(v) for v in done.values()):.0f}s, the sum of the step times ({steps}).",
+                   ""]
+    if other_figs:
+        heading = "**More figures:**" if key_figs else "**Key figures:**"
+        detail += [heading, "", "<p>"] + _figure_grid(other_figs) + ["</p>", ""]
 
-    figs = _figures(metrics)
-    if figs:
-        lines += ["**Key figures:**", "", "<p>"] + _figure_grid(figs) + ["</p>", ""]
+    if summary:
+        lines += ["<details>", "<summary><b>Detailed results</b>: all tables, evaluation notes and figures</summary>",
+                  ""] + detail + ["</details>", ""]
+    else:
+        lines += detail
     lines.append(f"_Generated by `scripts/evaluate.py` at {metrics.get('generated_at', 'n/a')} "
                  f"from `reports/metrics.json`._")
     return "\n".join(lines)

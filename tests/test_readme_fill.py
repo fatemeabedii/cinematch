@@ -139,15 +139,18 @@ def test_render_full_metrics_has_4_decimals_and_sections():
     assert "FAST MODE" not in text
 
 
-def test_render_headline_results_come_first():
+def test_render_summary_comes_first():
     text = _render()
-    head = text.split("**Data:**")[0]
-    assert head.startswith("**Headline results**")
-    assert "matrix factorization test RMSE 0.8700 vs 0.9100 for the bias baseline" in head
-    assert "NDCG@10 0.1500 vs 0.0277 for random ranking." in head
-    assert "test F1 0.7317 on synthetic bots (precision 0.9500, recall 0.8800; misses 2 of 3 bot types)" in head
-    assert "LinUCB's cumulative regret is 75% below random (30.0000 vs 120.0000" in head
-    assert "does not beat always serving the best single strategy" not in head  # 0.08 > best arm 0.075
+    head = text.split("<details>")[0]
+    assert head.startswith("**Summary**")
+    assert "| Rating prediction | Matrix factorization | RMSE 0.8700 | bias baseline 0.9100 |" in head
+    assert "| Unseen movies (cold start) | Two-tower content model | NDCG@10 0.1500 | random 0.0277 |" in head
+    assert ("| Bot detection (synthetic bots) | Gaussian density model | F1 0.7317 (precision 0.9500, "
+            "recall 0.8800) | misses 2 of 3 bot types |") in head
+    assert ("| Strategy selection (simulated clicks) | Contextual bandit (LinUCB) | regret 30.0000, 75% below "
+            "random (120.0000) | beats the best single strategy |") in head   # 0.08 > best arm 0.075
+    assert "**Warm movies**" not in head and "**Data:**" not in head   # detailed tables are folded away
+    assert "reports/figures/cf_training.png" in head                     # key figures stay visible
 
 
 def test_render_ranked_user_count_when_present():
@@ -173,7 +176,7 @@ def test_render_cold_genre_popularity_baseline():
                                                             "ndcg_at_10": 0.1, "n_eval_users": 800}
     text = _render(out)
     assert "| Genre popularity (non-personalized) | n/a | 0.0900 | 0.1200 | 0.1000 |" in text
-    assert "and 0.1000 for a non-personalized genre-popularity ranking." in text
+    assert "| NDCG@10 0.1500 | genre popularity 0.1000; random 0.0277 |" in text
     assert "So 59% of the two-tower's NDCG@10 gain over random comes from these priors" in text
     out["content"]["cold_baselines"]["genre_popularity"]["ndcg_at_10"] = 0.2
     assert "The two-tower does not beat the non-personalized genre-popularity ranking" in _render(out)
@@ -257,18 +260,19 @@ def test_render_bandit_best_single_arm_reference():
     text = _render(out)
     assert "always serving the best single strategy (taste-profile favourites) has mean expected reward 0.0850, " \
            "above both learners' mean reward" in text
-    assert "LinUCB's cumulative regret is 75% below random (30.0000 vs 120.0000, simulated clicks), but it does " \
-           "not beat always serving the best single strategy." in text
+    assert "| regret 30.0000, 75% below random (120.0000) | not better than the best single strategy |" in text
     out["bandit"]["best_fixed_arm"] = {"arm": "cluster_popular", "mean_reward": 0.085, "cum_regret": 25.0,
                                        "cum_regret_std": 1.0}
     text = _render(out)
     assert "| Always the best single arm (taste-profile favourites; reference, not a learner) | 0.0850 | " \
            "25.0000 ± 1.0000 |" in text
     assert "Neither learner beats always serving the best single strategy (taste-profile favourites)" in text
+    assert "| best single strategy in hindsight 25.0000 (not beaten) |" in text
     out["bandit"]["best_fixed_arm"]["cum_regret"] = 45.0
     text = _render(out)
     assert "- LinUCB beats always serving the best single strategy" in text
-    assert "does not beat always serving" not in text
+    assert "| best single strategy in hindsight 45.0000 |" in text
+    assert "does not beat always serving" not in text and "(not beaten)" not in text
 
 
 def test_render_bandit_untuned_params():
@@ -333,7 +337,7 @@ def test_render_nulls_as_na_and_not_shipped():
     m = assemble_metrics({}, _cfg(), None, generated_at="x")
     text = render_results_markdown(m)
     assert "n/a" in text and "not shipped" in text
-    assert "Headline results" not in text and "<details>" not in text
+    assert "**Summary**" not in text and "<details>" not in text
     assert not FOUR_DECIMALS.search(text)  # no numbers invented for missing models
     assert "reports/figures" not in text   # no links to figures that were never drawn
 
@@ -373,12 +377,12 @@ def test_render_ranking_rows_with_validation_chosen_values():
     assert "Matrix factorization (CF)" not in text
 
 
-def test_render_new_user_table_and_ranking_headlines():
+def test_render_new_user_table_and_ranking_summary():
     text = _render(_ranking_outputs())
-    head = text.split("**Data:**")[0]
-    assert ("**Top-10 ranking** (warm movies): NDCG@10 item-kNN 0.0681, MF + popularity prior 0.0609, "
-            "popularity 0.0532, MF ranked by its predicted rating 0.0287.") in head
-    assert "**New users** (simulated, 5 known ratings): item-kNN NDCG@10 0.3700 vs 0.3510 for popularity." in head
+    head = text.split("<details>")[0]
+    assert ("| Top-10 ranking | Item-kNN | NDCG@10 0.0681 | MF + popularity prior 0.0609; popularity 0.0532; "
+            "MF ranked by predicted rating 0.0287 |") in head
+    assert "| New users (5 known ratings, simulated) | Item-kNN | NDCG@10 0.3700 | popularity 0.3510 |" in head
     section = text.split("**New users (simulated, 5 known ratings)**")[1].split("**Cold-start movies**")[0]
     assert "| Strategy | P@10 | R@10 | NDCG@10 |" in section
     assert "| Popularity | 0.3000 | 0.1000 | 0.3510 |" in section
