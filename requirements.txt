@@ -1,0 +1,13 @@
+# Pinned to the versions used to produce the committed results.
+# Linux/Docker (CPU only): install torch first from the CPU index so this pin is already satisfied:
+#   pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1
+numpy==2.4.6
+pandas==3.0.6
+scikit-learn==1.9.1
+scipy==1.17.1
+matplotlib==3.11.2
+plotly==7.1.0
+streamlit==1.66.0
+pytest==9.1.1
+requests==2.34.2
