@@ -39,7 +39,7 @@ def precision_recall_ndcg_at_k(ranked_items: np.ndarray, relevant: np.ndarray,
 def rank_eval(score_fn: Callable[[np.ndarray], np.ndarray], eval_users: np.ndarray,
               holdout: dict[int, dict[int, float]], train_items: list[np.ndarray],
               candidate_mask: np.ndarray, k: int = TOP_K, batch: int = 256) -> dict:
-    """Average P@k / R@k / NDCG@k over `eval_users`.
+    """Average P@k / R@k / NDCG@k over `eval_users` (keys precision_at_{k}, recall_at_{k}, ndcg_at_{k}).
 
     score_fn(user_idx_batch) -> [B, I] scores. Train items and non-candidates (~candidate_mask) are
     set to -inf before ranking. Relevant = held-out rating >= RELEVANT_THRESHOLD among candidates;
@@ -65,8 +65,8 @@ def rank_eval(score_fn: Callable[[np.ndarray], np.ndarray], eval_users: np.ndarr
             sums += precision_recall_ndcg_at_k(ranked, rel, k)
             n_users += 1
     means = sums / n_users if n_users else np.zeros(3)
-    return {"precision_at_10": float(means[0]), "recall_at_10": float(means[1]),
-            "ndcg_at_10": float(means[2]), "n_eval_users": int(n_users)}
+    return {f"precision_at_{k}": float(means[0]), f"recall_at_{k}": float(means[1]),
+            f"ndcg_at_{k}": float(means[2]), "n_eval_users": int(n_users)}
 
 
 def rmse_eval(predict_fn: Callable[[np.ndarray, np.ndarray], np.ndarray], holdout_df: pd.DataFrame) -> float:

@@ -1,9 +1,12 @@
 """Smoke tests for the Streamlit app (streamlit.testing.v1.AppTest).
 
-The "models present" tests read the real repo artifacts (read-only) and skip when they are missing;
-the "models missing" branch is exercised by monkeypatching the Recommender to raise.
+The "models present" tests read the real repo artifacts (read-only) and skip when they are missing
+(including artifacts from before item-kNN existed: no models/item_knn.npz or cf_ranking.json);
+the "models missing" branch and the rate-movies flow are also exercised by monkeypatching the
+Recommender (to raise, or with a tiny fake).
 """
 import importlib.util
+import re
 import sys
 from pathlib import Path
 
@@ -19,14 +22,16 @@ from streamlit.testing.v1 import AppTest  # noqa: E402
 
 APP = ROOT / "app" / "streamlit_app.py"
 HAS_RECOMMEND = importlib.util.find_spec("cinematch.recommend") is not None
-HAS_REAL_ARTIFACTS = (ROOT / "models" / "cf_mf.npz").exists() and (
+HAS_REAL_ARTIFACTS = all((ROOT / "models" / f).exists() for f in ("cf_mf.npz", "item_knn.npz", "cf_ranking.json")) and (
     ROOT / "data" / "processed" / "ratings_split.parquet").exists()
+STRATEGY_LABELS = ["Similar movies (item-kNN)", "Matrix factorization", "Content (two-tower)"]
 HAS_BANDIT_ENV = (ROOT / "models" / "bandit_env.npz").exists()
 TIMEOUT = 60
 
 needs_recommend = pytest.mark.skipif(not HAS_RECOMMEND, reason="cinematch.recommend not implemented")
 needs_models = pytest.mark.skipif(not (HAS_RECOMMEND and HAS_REAL_ARTIFACTS),
-                                  reason="real models/processed data missing (run scripts/train_all.py)")
+                                  reason="real models/processed data missing or pre-item-kNN "
+                                         "(run scripts/train_all.py)")
 
 
 @pytest.fixture(autouse=True)
@@ -65,10 +70,21 @@ def _rating_sliders(at: AppTest) -> list:
     return [s for s in at.select_slider if str(s.key).startswith("rate_")]
 
 
+def _assert_cards_have_no_score(at: AppTest) -> None:
+    """Cards show title / genres / why only: no score, predicted rating or other decimal number."""
+    cards = " ".join(m.value for m in at.markdown if "<img" in m.value)
+    assert cards
+    assert "predicted rating" not in cards and "score" not in cards.lower()
+    assert not re.search(r">\s*-?\d+\.\d+\s*<", cards)
+    assert any("ordered best first" in c.value for c in at.caption)
+
+
 @needs_models
-@pytest.mark.parametrize("strategy", ["Collaborative filtering (MF)", "Content (two-tower)", "Hybrid"])
+@pytest.mark.parametrize("strategy", STRATEGY_LABELS)
 def test_rate_movies_and_recommend(strategy):
     at = _run()
+    assert at.radio(key="strategy").options == STRATEGY_LABELS
+    assert at.radio(key="strategy").value == "Similar movies (item-kNN)"     # default
     for slider, value in zip(_rating_sliders(at)[:4], ["5", "4", "2", "5"]):
         slider.set_value(value)
     at.radio(key="strategy").set_value(strategy)
@@ -79,11 +95,7 @@ def test_rate_movies_and_recommend(strategy):
     recs = at.session_state["recs"]
     assert len(recs["df"]) == 10
     assert recs["df"]["movie_id"].is_unique
-    cards = " ".join(m.value for m in at.markdown)
-    if strategy == "Hybrid":     # hybrid score is a z-score: never presented as a rating
-        assert "relative score" in cards and "predicted rating" not in cards
-    else:
-        assert "predicted rating" in cards and "relative score" not in cards
+    _assert_cards_have_no_score(at)
 
 
 @needs_models
@@ -91,7 +103,10 @@ def test_pick_taste_profile():
     at = _run()
     at.radio(key="rec_mode").set_value("Pick a taste profile").run(timeout=TIMEOUT)
     assert not at.exception
-    assert at.selectbox(key="profile_pick") is not None
+    pick = at.selectbox(key="profile_pick")
+    assert pick is not None
+    assert not any(str(o).startswith("Mainstream (") for o in pick.options)   # no fake genre lean shown
+    _assert_cards_have_no_score(at)   # profile scores exceed 5, so cards show no number
 
 
 @needs_models
@@ -120,11 +135,75 @@ def test_bandit_lab_simulation():
     assert at.slider(key="bandit_epsilon").value == pytest.approx(params.get("epsilon", cfg.bandit_epsilon))
     assert at.select_slider(key="bandit_alpha").value == pytest.approx(params.get("alpha", cfg.bandit_alpha))
     assert any(c.value.startswith("Defaults ") for c in at.caption)
-    at.slider(key="bandit_rounds").set_value(200)
+    rounds = at.slider(key="bandit_rounds")
+    assert rounds.max == 20_000                                      # full evaluation horizon available
+    assert rounds.value == min(max(round(cfg.bandit_rounds / 100) * 100, 100), 5_000)   # fast live default
+    assert any(f"use {cfg.bandit_rounds:,} rounds" in c.value for c in at.caption)
+    rounds.set_value(200)
     _button(at, "Run simulation").click()
     at.run(timeout=TIMEOUT)
     assert not at.exception
     assert set(at.session_state["bandit_results"]) == {"Random", "Epsilon-greedy", "LinUCB"}
+
+
+class _FakeRecommender:
+    """Just enough of recommend.Recommender for the Get Recommendations and Taste Profiles tabs."""
+
+    def __init__(self, *args, **kwargs):
+        import numpy as np
+
+        self.calls = []
+        self.k = 2
+        self.cl = {"names": ["Drama & War fans", "Mainstream"], "top_genres": [[["Drama", 5.0]], []],
+                   "labels": np.array([0, 1, 0, 1]), "pca_2d": np.zeros((4, 2)), "sizes": [2, 2]}
+
+    def _movies(self, n: int, start: int = 1):
+        import pandas as pd
+
+        ids = list(range(start, start + n))
+        return pd.DataFrame({"movie_id": ids, "title": [f"Movie {i} (1999)" for i in ids], "year": 1999,
+                             "genres": "Drama|War", "score": [4.987654 - 0.1 * j for j in range(n)],
+                             "why": "Because you liked Movie 1"})
+
+    def popular_for_rating(self, n: int = 30):
+        return self._movies(n).drop(columns=["score", "why"])
+
+    def recommend_from_ratings(self, ratings, strategy="knn", n=10):
+        self.calls.append(strategy)
+        _FakeRecommender.last_strategy = strategy
+        return self._movies(n, start=100)
+
+    def cluster_for_ratings(self, ratings):
+        return 0
+
+    def explain(self, strategy):
+        raise ValueError(strategy)          # the app must cope with a strategy that has no explanation
+
+    def recommend_for_cluster(self, cid, n=10):
+        return self._movies(n, start=200)
+
+
+@needs_recommend
+@pytest.mark.parametrize("label, strategy", [("Similar movies (item-kNN)", "knn"),
+                                             ("Matrix factorization", "cf"), ("Content (two-tower)", "content")])
+def test_rate_movies_strategies_with_fake_recommender(monkeypatch, label, strategy):
+    """Runs without real artifacts: the three strategies, item-kNN default, no hybrid, no numeric score."""
+    import cinematch.recommend as recommend
+
+    monkeypatch.setattr(recommend, "Recommender", _FakeRecommender)
+    at = _run()
+    assert not at.exception
+    radio = at.radio(key="strategy")
+    assert radio.options == STRATEGY_LABELS and radio.value == "Similar movies (item-kNN)"
+    for slider, value in zip(_rating_sliders(at)[:3], ["5", "4", "3"]):
+        slider.set_value(value)
+    radio.set_value(label)
+    _button(at, "Recommend").click()
+    at.run(timeout=TIMEOUT)
+    assert not at.exception
+    assert at.session_state["recs"]["strategy"] == strategy == _FakeRecommender.last_strategy
+    assert "4.98" not in " ".join(m.value for m in at.markdown)
+    _assert_cards_have_no_score(at)
 
 
 @needs_recommend
@@ -363,6 +442,8 @@ def test_how_it_works_dqn_table_ablation_and_tuned_bandit(tmp_path, monkeypatch)
                           "policies": {"random": {"mean_reward": 0.02, "cum_regret": 50.0, "cum_regret_std": 2.0},
                                        "linucb": {"mean_reward": 0.03, "cum_regret": 30.0, "cum_regret_std": 2.0}},
                           "params": {"epsilon": 0.05, "alpha": 0.03, "ridge": 1.0, "tuned_on_users": 1000},
+                          "best_fixed_arm": {"arm": "cluster_popular", "mean_reward": 0.031, "cum_regret": 25.0,
+                                             "cum_regret_std": 1.0},
                           "frac_users_no_signal": 0.619},
                "dqn": {"dqn": 0.61, "greedy_cf": 0.58, "random": 0.42, "diversity_heuristic": 0.63,
                        "n_train_users": 150, "n_eval_users": 151, "episodes": 3000, "session_len": 5}}
@@ -383,3 +464,81 @@ def test_how_it_works_dqn_table_ablation_and_tuned_bandit(tmp_path, monkeypatch)
     assert anomaly_frames and "+ item-deviation feature (ablation)" in list(anomaly_frames[0]["Model"])
     captions = " ".join(c.value for c in at.caption)
     assert "tuned on 1,000 disjoint simulated users" in captions and "62%" in captions
+    regret = next(m for m in at.metric if m.label == "LinUCB regret")
+    assert regret.value == "40% lower"                              # 1 - 30 / 50
+    assert "does not beat the best single strategy (hindsight)" in str(regret.delta)   # 30 > 25
+    assert "does not beat always serving the best single strategy (taste-profile favourites" in captions
+    bandit_frames = [f for f in frames if "Cumulative regret" in f.columns]
+    assert any("best single strategy in hindsight" in m for m in bandit_frames[0]["Model"])
+    assert any(m.label == "Bot detection F1 (synthetic bots)" for m in at.metric)
+
+
+@needs_recommend
+def test_how_it_works_ranking_rows_and_new_user_table(tmp_path, monkeypatch):
+    """MF ranked by predicted rating, MF + popularity prior, item-kNN rows and the new-user simulation table."""
+    import json
+
+    import cinematch.config as config
+
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    rank = {"precision_at_10": 0.1, "recall_at_10": 0.05}
+    metrics = {"generated_at": "2026-01-01T00:00:00+00:00", "dataset": "MovieLens-1M", "split": "test split",
+               "fast": False, "data": {"n_users": 10, "n_items": 5},
+               "rating_models": {
+                   "popularity": {"rmse": None, **rank, "ndcg_at_10": 0.05},
+                   "cf_mf": {"rmse": 0.89, **rank, "ndcg_at_10": 0.03},
+                   "cf_mf_pop": {**rank, "ndcg_at_10": 0.06, "beta": 1.0},
+                   "item_knn": {**rank, "ndcg_at_10": 0.07, "k": 200, "gamma": 0.25},
+                   "cold_baselines": {"random": {**rank, "ndcg_at_10": 0.01}},
+                   "new_users": {"n_users": 1000, "n_seed_ratings": 5, "strategies": {
+                       "popularity": {**rank, "ndcg_at_10": 0.35}, "mf_foldin": {**rank, "ndcg_at_10": 0.22},
+                       "mf_foldin_pop": {**rank, "ndcg_at_10": 0.36}, "item_knn": {**rank, "ndcg_at_10": 0.37}}}},
+               "anomaly": None, "clustering": None, "bandit": None, "dqn": None}
+    (reports / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    monkeypatch.setattr(config, "REPORTS_DIR", reports)
+    monkeypatch.setattr(config, "MODELS_DIR", tmp_path)
+    at = _run()
+    assert not at.exception
+    frames = [d.value for d in at.dataframe]
+    warm = next(f for f in frames if "RMSE" in f.columns and "Popularity" in list(f["Model"]))
+    assert list(warm["Model"]) == ["Popularity", "Matrix factorization (ranked by predicted rating)",
+                                   "MF + popularity prior (beta = 1)", "Item-kNN (k = 200)"]
+    new = next(f for f in frames if "Strategy" in f.columns)
+    assert list(new["Strategy"]) == ["Popularity", "MF fold-in (ranked by predicted rating)",
+                                     "MF fold-in + popularity prior", "Item-kNN on the liked seed movies"]
+    assert new["NDCG@10"].tolist() == [0.35, 0.22, 0.36, 0.37]
+    assert any("New users** (simulated, 5 known ratings" in m.value for m in at.markdown)
+    assert any("1,000 sampled users" in c.value for c in at.caption)
+    tile = next(m for m in at.metric if m.label == "Top-10 NDCG@10 (item-kNN)")
+    assert str(tile.delta) == "+0.0200 vs popularity"
+
+
+@needs_recommend
+def test_how_it_works_cold_start_vs_genre_popularity(tmp_path, monkeypatch):
+    """The cold-start table and tile compare the two-tower with genre popularity, not just random."""
+    import json
+
+    import cinematch.config as config
+
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    rank = {"precision_at_10": 0.1, "recall_at_10": 0.1}
+    metrics = {"generated_at": "2026-01-01T00:00:00+00:00", "dataset": "MovieLens-1M", "split": "test split",
+               "fast": False, "data": {"n_users": 10, "n_items": 5},
+               "rating_models": {"two_tower": {"cold": {"rmse": 1.0, **rank, "ndcg_at_10": 0.13}},
+                                 "cold_baselines": {"user_bias": {"rmse": 1.05},
+                                                    "genre_popularity": {**rank, "ndcg_at_10": 0.12},
+                                                    "random": {**rank, "ndcg_at_10": 0.05}}},
+               "anomaly": None, "clustering": None, "bandit": None, "dqn": None}
+    (reports / "metrics.json").write_text(json.dumps(metrics), encoding="utf-8")
+    monkeypatch.setattr(config, "REPORTS_DIR", reports)
+    monkeypatch.setattr(config, "MODELS_DIR", tmp_path)
+    at = _run()
+    assert not at.exception
+    cold = [d.value for d in at.dataframe if "Two-tower (metadata only)" in list(d.value.get("Model", []))]
+    assert len(cold) == 1
+    assert list(cold[0]["Model"]) == ["Two-tower (metadata only)", "User-bias baseline (best CF can do)",
+                                      "Genre popularity (non-personalized)", "Random ranking"]
+    tile = next(m for m in at.metric if m.label == "Cold-start NDCG@10")
+    assert str(tile.delta) == "+0.0800 vs random ranking; +0.0100 vs genre popularity"

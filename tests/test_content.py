@@ -205,10 +205,13 @@ def test_cold_baselines_keys_seeded_random_and_missing_baseline(tiny_dirs):
     cfg, dirs = tiny_dirs
     data = _loaded(cfg, dirs)
     out = content.cold_baselines(cfg, data, dirs["models_dir"])     # no cf_baseline.npz in models_dir
-    assert set(out) == {"user_bias", "random"}
+    assert set(out) == {"user_bias", "random", "genre_popularity"}
     assert out["user_bias"] == {"rmse": None}
-    assert set(out["random"]) == {"precision_at_10", "recall_at_10", "ndcg_at_10", "n_eval_users"}
+    assert set(out["random"]) == {"precision_at_10", "recall_at_10", "ndcg_at_10", "n_eval_users", "n_seeds"}
+    assert out["random"]["n_seeds"] == content.N_RANDOM_SEEDS
     assert out["random"]["n_eval_users"] > 0
+    assert set(out["genre_popularity"]) == {"precision_at_10", "recall_at_10", "ndcg_at_10", "n_eval_users"}
+    assert out["genre_popularity"]["n_eval_users"] == out["random"]["n_eval_users"]
     for k in ("precision_at_10", "recall_at_10", "ndcg_at_10"):
         assert np.isfinite(out["random"][k]) and 0.0 <= out["random"][k] <= 1.0
     assert content.cold_baselines(cfg, data, dirs["models_dir"]) == out    # seeded -> identical
@@ -247,3 +250,82 @@ def test_cold_baselines_user_bias_rmse(tiny_dirs):
     expected = np.sqrt(np.mean((pred - cold["rating"].to_numpy()) ** 2))
     rmse = content.cold_baselines(cfg, data, dirs["models_dir"])["user_bias"]["rmse"]
     assert rmse == pytest.approx(expected, abs=1e-4)
+
+
+def _planted_cold_world(n_eval=30, seed=0):
+    """Warm items 0-9 (0-4 genre 0 = popular, 5-9 genre 1), cold items 10-19 genre 1, 20-29 genre 0,
+    30 no genre. Eval users (0..n_eval-1) like 3 random cold genre-0 items; tie-breaking by lower
+    index favours the unpopular genre, so only a real genre prior can win. Non-eval users have
+    cold rows (split "cold") on genre-1 items that a cold-rating leak would reward."""
+    rng = np.random.default_rng(seed)
+    n_items, n_users = 31, n_eval + 20
+    G = np.zeros((n_items, 18), dtype=np.float32)
+    G[[0, 1, 2, 3, 4, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29], 0] = 1.0
+    G[[5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19], 1] = 1.0
+    warm = np.zeros(n_items, dtype=bool)
+    warm[:10] = True
+    rows = []
+    for u in range(n_users):
+        for i in range(5):                                 # every user rates the popular warm genre
+            rows.append((u, i, 4.0, "train"))
+        rows.append((u, 5 + u % 5, 3.0, "train"))          # 1 rating per user on the other genre
+    for u in range(n_eval):
+        for i in rng.choice(np.arange(20, 30), size=3, replace=False):
+            rows.append((u, int(i), 5.0, "cold"))
+        rows.append((u, int(rng.integers(10, 20)), 2.0, "cold"))
+    for u in range(n_eval, n_users):
+        for i in range(10, 20):
+            rows.append((u, i, 5.0, "cold"))
+    rs = pd.DataFrame(rows, columns=["u", "i", "rating", "split"])
+    return _world_dict(rs, G, warm, n_users, np.arange(n_eval))
+
+
+def _world_dict(rs, G, warm, n_users, eval_users):
+    cold = rs[rs["split"] == "cold"]
+    train = rs[rs["split"] == "train"]
+    return {"ratings": rs, "item_features": {"genre_multi_hot": G}, "warm_mask": warm,
+            "eval_users": eval_users,
+            "holdout_cold": {int(u): dict(zip(g["i"].tolist(), g["rating"].tolist()))
+                             for u, g in cold.groupby("u")},
+            "train_items": [np.sort(train.loc[train["u"] == u, "i"].to_numpy()) for u in range(n_users)]}
+
+
+def test_genre_popularity_scores_known_values():
+    d = _planted_cold_world()
+    s = content.genre_popularity_scores(d)
+    n_users = len(d["train_items"])
+    # genre 0: 5 warm movies x n_users ratings each; genre 1: n_users ratings over 5 warm movies.
+    pop0, pop1 = float(n_users), n_users / 5
+    np.testing.assert_allclose(s[[0, 20, 29]], pop0)
+    np.testing.assert_allclose(s[[5, 10, 19]], pop1)
+    assert s[30] == 0.0                                    # no genre -> 0
+    G = d["item_features"]["genre_multi_hot"].copy()
+    G[30, [0, 1]] = 1.0                                    # two genres -> mean of the two
+    s2 = content.genre_popularity_scores({**d, "item_features": {"genre_multi_hot": G}})
+    assert s2[30] == pytest.approx((pop0 + pop1) / 2)
+
+
+def test_genre_popularity_beats_random_in_planted_world(tmp_path):
+    cfg = Config(fast=True)
+    out = content.cold_baselines(cfg, _planted_cold_world(), tmp_path)
+    gp, rnd = out["genre_popularity"], out["random"]
+    assert set(gp) == {"precision_at_10", "recall_at_10", "ndcg_at_10", "n_eval_users"}
+    assert gp["n_eval_users"] == rnd["n_eval_users"] == 30
+    assert gp["recall_at_10"] == 1.0 and gp["precision_at_10"] == pytest.approx(0.3, abs=1e-4)
+    for k in ("precision_at_10", "recall_at_10", "ndcg_at_10"):
+        assert gp[k] > rnd[k]
+
+
+def test_genre_popularity_ignores_cold_ratings(tmp_path):
+    cfg = Config(fast=True)
+    d = _planted_cold_world()
+    rs = d["ratings"].copy()
+    non_eval_cold = (rs["split"] == "cold") & (rs["u"] >= 30)
+    rs.loc[non_eval_cold, "rating"] = 1.0
+    extra = pd.DataFrame({"u": np.repeat(np.arange(30, 50), 10), "i": np.tile(np.arange(20, 30), 20),
+                          "rating": 5.0, "split": "cold"})
+    changed = _world_dict(pd.concat([rs, extra], ignore_index=True), d["item_features"]["genre_multi_hot"],
+                          d["warm_mask"], len(d["train_items"]), d["eval_users"])
+    np.testing.assert_array_equal(content.genre_popularity_scores(changed), content.genre_popularity_scores(d))
+    assert (content.cold_baselines(cfg, changed, tmp_path)["genre_popularity"]
+            == content.cold_baselines(cfg, d, tmp_path)["genre_popularity"])

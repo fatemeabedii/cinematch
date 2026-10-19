@@ -1,0 +1,270 @@
+{
+  "generated_at": "2026-10-19T15:16:35+00:00",
+  "dataset": "MovieLens-1M",
+  "split": "per-user time-aware 80/10/10 train/val/test, 6% of movies with >= 20 ratings held out as cold items, seed 42",
+  "fast": false,
+  "train_seconds": {
+    "anomaly": 3.4,
+    "data": 5.5,
+    "cf": 25.0,
+    "content": 23.0,
+    "clustering": 2.7,
+    "bandit": 16.8,
+    "dqn": 23.6
+  },
+  "data": {
+    "n_users": 6040,
+    "n_items": 3883,
+    "n_cold_items": 183,
+    "n_flagged_users": 31,
+    "n_train": 753429,
+    "n_val": 90822,
+    "n_test": 90822,
+    "n_cold": 65136,
+    "n_eval_users": 2000
+  },
+  "rating_models": {
+    "popularity": {
+      "rmse": null,
+      "precision_at_10": 0.0385,
+      "recall_at_10": 0.0516,
+      "ndcg_at_10": 0.0532
+    },
+    "bias_baseline": {
+      "rmse": 0.9323,
+      "precision_at_10": 0.0139,
+      "recall_at_10": 0.0144,
+      "ndcg_at_10": 0.0179
+    },
+    "cf_mf": {
+      "rmse": 0.8887,
+      "precision_at_10": 0.0216,
+      "recall_at_10": 0.03,
+      "ndcg_at_10": 0.0287,
+      "best_epoch": 12,
+      "dim": 32
+    },
+    "cf_mf_pop": {
+      "precision_at_10": 0.0424,
+      "recall_at_10": 0.0595,
+      "ndcg_at_10": 0.0608,
+      "beta": 1.0
+    },
+    "item_knn": {
+      "precision_at_10": 0.0463,
+      "recall_at_10": 0.068,
+      "ndcg_at_10": 0.0683,
+      "k": 200,
+      "gamma": 0.0
+    },
+    "new_users": {
+      "n_users": 943,
+      "n_seed_ratings": 5,
+      "strategies": {
+        "popularity": {
+          "precision_at_10": 0.0368,
+          "recall_at_10": 0.0518,
+          "ndcg_at_10": 0.0517
+        },
+        "mf_foldin": {
+          "precision_at_10": 0.0241,
+          "recall_at_10": 0.0312,
+          "ndcg_at_10": 0.0337
+        },
+        "mf_foldin_pop": {
+          "precision_at_10": 0.0392,
+          "recall_at_10": 0.0567,
+          "ndcg_at_10": 0.0548
+        },
+        "item_knn": {
+          "precision_at_10": 0.0388,
+          "recall_at_10": 0.0675,
+          "ndcg_at_10": 0.0586
+        }
+      }
+    },
+    "two_tower": {
+      "rmse": 0.9839,
+      "precision_at_10": 0.0045,
+      "recall_at_10": 0.0071,
+      "ndcg_at_10": 0.0053,
+      "best_epoch": 11,
+      "cold": {
+        "rmse": 1.021,
+        "precision_at_10": 0.0997,
+        "recall_at_10": 0.1602,
+        "ndcg_at_10": 0.1309,
+        "n_eval_users": 1850
+      }
+    },
+    "cold_baselines": {
+      "user_bias": {
+        "rmse": 1.0615
+      },
+      "random": {
+        "precision_at_10": 0.0398,
+        "recall_at_10": 0.0539,
+        "ndcg_at_10": 0.0512,
+        "n_eval_users": 1850,
+        "n_seeds": 10
+      },
+      "genre_popularity": {
+        "precision_at_10": 0.0951,
+        "recall_at_10": 0.142,
+        "ndcg_at_10": 0.1209,
+        "n_eval_users": 1850
+      }
+    }
+  },
+  "clustering": {
+    "k": 4,
+    "silhouette": 0.0656,
+    "names": [
+      "Action & Sci-Fi fans",
+      "Mainstream",
+      "Romance & Children's fans",
+      "Drama & Film-Noir fans"
+    ],
+    "sizes": [
+      1174,
+      1901,
+      1324,
+      1641
+    ]
+  },
+  "anomaly": {
+    "epsilon": -17.7395,
+    "epsilon_capped": false,
+    "val_f1": 0.7317,
+    "test_precision": 0.9375,
+    "test_recall": 0.6,
+    "test_f1": 0.7317,
+    "n_bots_test": 150,
+    "n_real_flagged": 6,
+    "n_real_flagged_all": 31,
+    "per_bot_type_recall": {
+      "push": 1.0,
+      "nuke": 1.0,
+      "random_spam": 0.0,
+      "camouflage_popular": 0.0,
+      "camouflage_slow": 1.0
+    },
+    "ablation_plus_item_dev": {
+      "epsilon": -25.5033,
+      "val_f1": 0.7317,
+      "test_precision": 0.9184,
+      "test_recall": 0.6,
+      "test_f1": 0.7258,
+      "per_bot_type_recall": {
+        "push": 1.0,
+        "nuke": 1.0,
+        "random_spam": 0.0,
+        "camouflage_popular": 0.0,
+        "camouflage_slow": 1.0
+      }
+    },
+    "ablation_plus_item_dev_capped": false
+  },
+  "bandit": {
+    "oracle_mean_reward": 0.0458,
+    "arm_mean_expected_reward": {
+      "cf": 0.0352,
+      "content": 0.0126,
+      "cluster_popular": 0.0334,
+      "trending": 0.0248
+    },
+    "best_fixed_arm": {
+      "arm": "cf",
+      "mean_reward": 0.0349,
+      "cum_regret": 214.9356,
+      "cum_regret_std": 3.0395
+    },
+    "rounds": 20000,
+    "n_seeds": 5,
+    "frac_users_no_signal": 0.596,
+    "params": {
+      "epsilon": 0.05,
+      "alpha": 0.01,
+      "ridge": 1.0,
+      "tuned_on_users": 1000
+    },
+    "tuning": {
+      "alpha": {
+        "1.0": 266.1725,
+        "0.3": 236.022,
+        "0.1": 231.6335,
+        "0.03": 223.172,
+        "0.01": 203.0455
+      },
+      "epsilon": {
+        "0.2": 241.359,
+        "0.1": 206.4155,
+        "0.05": 205.395,
+        "0.02": 263.3275
+      }
+    },
+    "tuning_std": {
+      "alpha": {
+        "1.0": 4.5276,
+        "0.3": 10.6094,
+        "0.1": 11.7458,
+        "0.03": 6.5662,
+        "0.01": 1.1462
+      },
+      "epsilon": {
+        "0.2": 17.129,
+        "0.1": 1.5521,
+        "0.05": 1.0904,
+        "0.02": 4.727
+      }
+    },
+    "policies": {
+      "random": {
+        "mean_reward": 0.0262,
+        "cum_regret": 389.0596,
+        "cum_regret_std": 7.9565,
+        "arm_counts": [
+          4982.6,
+          4997.4,
+          4978.6,
+          5041.4
+        ]
+      },
+      "epsilon_greedy": {
+        "mean_reward": 0.0337,
+        "cum_regret": 240.0854,
+        "cum_regret_std": 13.9208,
+        "arm_counts": [
+          10189.0,
+          317.0,
+          9201.8,
+          292.2
+        ]
+      },
+      "linucb": {
+        "mean_reward": 0.0334,
+        "cum_regret": 244.9006,
+        "cum_regret_std": 16.8127,
+        "arm_counts": [
+          10448.0,
+          962.8,
+          7165.8,
+          1423.4
+        ]
+      }
+    }
+  },
+  "dqn": {
+    "dqn": 0.3407,
+    "greedy_cf": 0.4298,
+    "random": 0.3759,
+    "diversity_heuristic": 0.4649,
+    "oracle": 0.8199,
+    "n_train_users": 128,
+    "n_eval_users": 128,
+    "n_users_total": 1000,
+    "n_users_with_signal": 256,
+    "episodes": 3000,
+    "session_len": 5
+  }
+}

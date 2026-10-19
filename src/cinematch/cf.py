@@ -15,9 +15,10 @@ import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 
-from .config import FIGURES_DIR, MODELS_DIR, PROCESSED_DIR, TOP_K
+from .config import FIGURES_DIR, MODELS_DIR, PROCESSED_DIR, RELEVANT_THRESHOLD, TOP_K
 
 TRENDING_DAYS = 90
+NEW_USER_FOLD_IN_REG = 10.0  # ridge weight when folding a new user into the MF space (recommend.py imports it)
 
 
 def _torch():
@@ -234,6 +235,101 @@ def score_users(cf: dict, P_rows, bu_rows) -> np.ndarray:
     return cf["mu"] + bu_rows[:, None] + cf["bi"][None, :] + P_rows @ cf["Q"].T
 
 
+def rank_scores(cf: dict, P_rows, bu_rows, count, beta: float) -> np.ndarray:
+    """MF ranking score: predicted rating + beta * log1p(train count)  ->  [B, I].
+
+    Ranking by predicted rating alone collapses to the item bias, which rewards films rated 5 by a
+    handful of people. The popularity prior shrinks the list toward films many people watched;
+    beta is chosen on the validation split (cf_ranking.json). `score_users` stays the predicted rating.
+    """
+    return score_users(cf, P_rows, bu_rows) + beta * np.log1p(np.asarray(count, dtype=np.float32))[None, :]
+
+
+# ----------------------------------------------------------------------------- item-item kNN
+def liked_matrix(ratings_split: pd.DataFrame, n_users: int, n_items: int, exclude_users=()) -> sp.csr_matrix:
+    """Binary CSR [U, I]: 1 where a TRAIN rating is >= RELEVANT_THRESHOLD (rows of `exclude_users` dropped)."""
+    df = ratings_split[(ratings_split["split"] == "train") & (ratings_split["rating"] >= RELEVANT_THRESHOLD)]
+    if len(exclude_users):
+        df = df[~df["u"].isin(np.asarray(list(exclude_users)))]
+    return sp.csr_matrix((np.ones(len(df), np.float32), (df["u"].to_numpy(), df["i"].to_numpy())),
+                         shape=(n_users, n_items))
+
+
+def build_item_knn(liked: sp.csr_matrix, k: int) -> sp.csr_matrix:
+    """Cosine item-item similarity of the binary `liked` [U, I] matrix, top-k per row  ->  CSR [I, I] float32.
+
+    S[i, j] = |users who liked i and j| / sqrt(|liked i| * |liked j|); the diagonal is zero and only
+    the k largest positive entries of each row are kept (row i = the neighbours of item i).
+    """
+    liked = sp.csr_matrix(liked, dtype=np.float32)
+    n_items = liked.shape[1]
+    norms = np.sqrt(np.asarray(liked.sum(axis=0), dtype=np.float64).ravel())
+    inv = np.divide(1.0, norms, out=np.zeros_like(norms), where=norms > 0).astype(np.float32)
+    sim = (liked.T @ liked).toarray().astype(np.float32)
+    sim *= inv[:, None]
+    sim *= inv[None, :]
+    np.fill_diagonal(sim, 0.0)
+    k = int(min(k, max(n_items - 1, 1)))
+    top = np.argpartition(-sim, k - 1, axis=1)[:, :k] if n_items > 1 else np.zeros((n_items, 0), np.int64)
+    rows = np.repeat(np.arange(n_items), top.shape[1])
+    cols = top.ravel()
+    vals = sim[rows, cols]
+    keep = vals > 0
+    S = sp.csr_matrix((vals[keep], (rows[keep], cols[keep])), shape=(n_items, n_items), dtype=np.float32)
+    S.sort_indices()
+    return S
+
+
+def save_item_knn(S: sp.csr_matrix, path) -> None:
+    """Write item_knn.npz with the CSR arrays (data, indices, indptr, shape); loadable with numpy only."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    S = sp.csr_matrix(S)
+    np.savez(path, data=S.data.astype(np.float32), indices=S.indices, indptr=S.indptr,
+             shape=np.asarray(S.shape, dtype=np.int64))
+
+
+def load_item_knn(models_dir=MODELS_DIR) -> sp.csr_matrix:
+    """The item-kNN similarity CSR [I, I] from models_dir/item_knn.npz."""
+    z = _load_npz(Path(models_dir) / "item_knn.npz", ("data", "indices", "indptr", "shape"))
+    return sp.csr_matrix((z["data"], z["indices"], z["indptr"]), shape=tuple(int(x) for x in z["shape"]))
+
+
+def knn_scores(S: sp.csr_matrix, liked_rows: sp.csr_matrix) -> np.ndarray:
+    """Item-kNN scores = liked_rows @ S  ->  dense [B, I]: each liked item votes for its neighbours."""
+    return np.asarray((sp.csr_matrix(liked_rows, dtype=np.float32) @ S).toarray())
+
+
+def knn_top_contributor(S: sp.csr_matrix, liked_items: np.ndarray, item: int) -> int:
+    """The liked item whose similarity to `item` is largest (the "because you liked" anchor); -1 if none > 0."""
+    liked_items = np.asarray(liked_items, dtype=np.int64)
+    if len(liked_items) == 0:
+        return -1
+    sims = np.asarray(S[liked_items, int(item)].toarray()).ravel()
+    best = int(np.argmax(sims))
+    return int(liked_items[best]) if sims[best] > 0 else -1
+
+
+def seed_liked_items(ratings: dict[int, float]) -> np.ndarray:
+    """Items a new user liked: ratings >= 4, else ratings >= 3, else none (then rank by popularity)."""
+    for threshold in (RELEVANT_THRESHOLD, 3):
+        items = [i for i, r in ratings.items() if r >= threshold]
+        if items:
+            return np.asarray(items, dtype=np.int64)
+    return np.zeros(0, dtype=np.int64)
+
+
+def new_user_knn_scores(S: sp.csr_matrix, ratings: dict[int, float], count, gamma: float,
+                        popularity) -> np.ndarray:
+    """New-user item-kNN ranking scores [I]: kNN on the liked seeds + gamma*log1p(count); popularity if none liked."""
+    liked = seed_liked_items(ratings)
+    if len(liked) == 0:
+        return np.asarray(popularity, dtype=np.float64).copy()
+    row = sp.csr_matrix((np.ones(len(liked), np.float32), (np.zeros(len(liked), np.int64), liked)),
+                        shape=(1, S.shape[0]))
+    return knn_scores(S, row)[0].astype(np.float64) + gamma * np.log1p(np.asarray(count, dtype=np.float64))
+
+
 # ----------------------------------------------------------------------------- pipeline steps
 def _get_data(cfg, ctx: dict) -> dict | None:
     """ctx["data"], loading processed data + eval users via data.eval_step when run alone."""
@@ -252,8 +348,10 @@ def train_step(cfg, ctx: dict) -> dict:
     models_dir = Path(ctx.get("models_dir", MODELS_DIR))
     models_dir.mkdir(parents=True, exist_ok=True)
     data = ctx.get("data")
-    if data is None:
-        data = data_mod.load_processed(Path(ctx.get("processed_dir", PROCESSED_DIR)))
+    if data is None or "eval_users" not in data:  # run alone: load processed data + eval users
+        if data_mod.eval_step(cfg, ctx) is None:
+            data_mod.load_processed(Path(ctx.get("processed_dir", PROCESSED_DIR)))  # raises the helpful error
+        data = ctx["data"]
     rs = data["ratings"]
     n_users, n_items = data["stats"]["n_users"], data["stats"]["n_items"]
     exclude = data_mod.flagged_indices(data["index_maps"])
@@ -271,10 +369,123 @@ def train_step(cfg, ctx: dict) -> dict:
     (models_dir / "cf_history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
 
     fit_rows = rs[~rs["u"].isin(exclude)] if len(exclude) else rs  # flagged users do not vote either
-    np.savez(models_dir / "popularity.npz", **popularity_scores(fit_rows, n_items))
-    print(f"[cf] wrote cf_baseline.npz, cf_mf.npz, popularity.npz, cf_history.json to {models_dir}")
+    pop = popularity_scores(fit_rows, n_items)
+    np.savez(models_dir / "popularity.npz", **pop)
+
+    liked = liked_matrix(rs, n_users, n_items, exclude_users=exclude)
+    ranking, S = select_ranking(cfg, data, load_cf(models_dir), liked, pop["count"])
+    save_item_knn(S, models_dir / "item_knn.npz")
+    (models_dir / "cf_ranking.json").write_text(json.dumps(ranking, indent=2), encoding="utf-8")
+    print(f"[cf] wrote cf_baseline.npz, cf_mf.npz, popularity.npz, cf_history.json, item_knn.npz, "
+          f"cf_ranking.json to {models_dir}")
     return {"best_epoch": history["best_epoch"], "best_val_rmse": min(history["val_rmse"]),
-            "baseline_val_rmse": history["baseline_val_rmse"]}
+            "baseline_val_rmse": history["baseline_val_rmse"], "rank_beta": ranking["beta"],
+            "knn_k": ranking["knn_k"], "knn_gamma": ranking["knn_gamma"]}
+
+
+def select_ranking(cfg, data: dict, mf: dict, liked: sp.csr_matrix, count) -> tuple[dict, sp.csr_matrix]:
+    """Choose the MF popularity weight beta and the item-kNN (k, gamma) by VALIDATION NDCG@10.
+
+    Protocol = the test protocol with the val split as holdout: same eval users, warm candidates,
+    train items masked, rating >= 4 relevant. Ties keep the earlier grid value. Returns the
+    cf_ranking.json dict and the similarity matrix of the chosen k.
+    """
+    from . import data as data_mod
+    from .metrics import rank_eval
+
+    key = f"ndcg_at_{TOP_K}"
+    lc = np.log1p(np.asarray(count, dtype=np.float32))[None, :]
+    args = dict(eval_users=data["eval_users"], holdout=data_mod.holdout_dict(data["ratings"], "val"),
+                train_items=data["train_items"], candidate_mask=data["warm_mask"], k=TOP_K, batch=cfg.eval_rank_batch)
+
+    beta_ndcg = {}
+    for beta in cfg.cf_rank_pop_betas:
+        score_fn = lambda u, b=beta: rank_scores(mf, mf["P"][u], mf["bu"][u], count, b)  # noqa: E731
+        beta_ndcg[float(beta)] = rank_eval(score_fn, **args)[key]
+    best_beta = max(beta_ndcg, key=beta_ndcg.get)  # first maximum in grid order
+
+    knn_ndcg, sims = {}, {}
+    for k in cfg.knn_neighbors:
+        sims[int(k)] = S = build_item_knn(liked, int(k))
+        for gamma in cfg.knn_pop_gammas:
+            score_fn = lambda u, S=S, g=gamma: knn_scores(S, liked[u]) + g * lc  # noqa: E731
+            knn_ndcg[(int(k), float(gamma))] = rank_eval(score_fn, **args)[key]
+    best_k, best_gamma = max(knn_ndcg, key=knn_ndcg.get)
+
+    print(f"[cf] val NDCG@10 by beta: {_fmt_grid(beta_ndcg)} -> beta={best_beta}")
+    print(f"[cf] val NDCG@10 by (k, gamma): {_fmt_grid(knn_ndcg)} -> k={best_k}, gamma={best_gamma}")
+    ranking = {"beta": best_beta, "knn_k": best_k, "knn_gamma": best_gamma,
+               "val_ndcg": {"beta": {str(b): round(v, 4) for b, v in beta_ndcg.items()},
+                            "knn": {f"{k},{g}": round(v, 4) for (k, g), v in knn_ndcg.items()}}}
+    return ranking, sims[best_k]
+
+
+def _fmt_grid(grid: dict) -> str:
+    return ", ".join(f"{k}: {v:.4f}" for k, v in grid.items())
+
+
+def load_ranking(models_dir=MODELS_DIR) -> dict:
+    """cf_ranking.json: {"beta", "knn_k", "knn_gamma", "val_ndcg"} chosen on validation by train_step."""
+    return json.loads((Path(models_dir) / "cf_ranking.json").read_text(encoding="utf-8"))
+
+
+def _prn(r: dict) -> dict:
+    """The precision/recall/NDCG@k entries of a rank_eval result."""
+    return {m: r[m] for m in (f"precision_at_{TOP_K}", f"recall_at_{TOP_K}", f"ndcg_at_{TOP_K}")}
+
+
+def simulate_new_users(cfg, data: dict, mf: dict, S: sp.csr_matrix, pop, count, beta: float,
+                       gamma: float) -> dict:
+    """Replay eval users as brand-new app users who rated only a few well-known movies.
+
+    For `cfg.new_user_eval_users` seeded eval users, the only known ratings are
+    `cfg.new_user_seed_ratings` random TRAIN ratings on movies with >= `cfg.new_user_min_train_ratings`
+    train ratings. Each strategy scores like recommend.py does for new users (MF fold-in with
+    NEW_USER_FOLD_IN_REG; item-kNN on the liked seeds). Candidates = those well-known warm movies
+    minus ALL of the user's train items; relevant = TEST rating >= 4. Users with too few eligible
+    ratings or without a relevant candidate are skipped.
+    """
+    from .metrics import precision_recall_ndcg_at_k
+
+    rng = np.random.default_rng(cfg.seed)
+    count = np.asarray(count, dtype=np.float64)
+    eligible = np.asarray(data["warm_mask"], dtype=bool) & (count >= cfg.new_user_min_train_ratings)
+    users = np.asarray(data["eval_users"])
+    if len(users) > cfg.new_user_eval_users:
+        users = np.sort(rng.choice(users, cfg.new_user_eval_users, replace=False))
+    rs = data["ratings"]
+    tr = rs[(rs["split"] == "train") & rs["u"].isin(users)]
+    by_user = {u: (g["i"].to_numpy(), g["rating"].to_numpy(np.float64)) for u, g in tr.groupby("u")}
+    holdout = data["holdout_test"]
+    names = ("popularity", "mf_foldin", "mf_foldin_pop", "item_knn")
+    sums, n_done = {name: np.zeros(3) for name in names}, 0
+    for u in users.tolist():
+        items, ratings = by_user.get(u, (np.zeros(0, np.int64), np.zeros(0)))
+        ok = np.flatnonzero(eligible[items])
+        if len(ok) < cfg.new_user_seed_ratings:
+            continue
+        pick = rng.choice(ok, cfg.new_user_seed_ratings, replace=False)
+        seeds = dict(zip(items[pick].tolist(), ratings[pick].tolist()))
+        cand = eligible.copy()
+        cand[items] = False
+        rel = np.array([i for i, r in holdout.get(u, {}).items() if r >= RELEVANT_THRESHOLD and cand[i]], np.int64)
+        if len(rel) == 0:
+            continue
+        p, bu = fold_in_user(seeds, mf, reg=NEW_USER_FOLD_IN_REG)
+        scores = {"popularity": np.asarray(pop, dtype=np.float64),
+                  "mf_foldin": score_users(mf, p, bu)[0],
+                  "mf_foldin_pop": rank_scores(mf, p, bu, count, beta)[0],
+                  "item_knn": new_user_knn_scores(S, seeds, count, gamma, pop)}
+        for name, s in scores.items():
+            ranked = np.argsort(-np.where(cand, s, -np.inf), kind="stable")[:TOP_K]
+            sums[name] += precision_recall_ndcg_at_k(ranked, rel, TOP_K)
+        n_done += 1
+    strategies = {}
+    for name, total in sums.items():
+        m = total / max(n_done, 1)
+        strategies[name] = _round({f"precision_at_{TOP_K}": float(m[0]), f"recall_at_{TOP_K}": float(m[1]),
+                                   f"ndcg_at_{TOP_K}": float(m[2])})
+    return {"n_users": n_done, "n_seed_ratings": int(cfg.new_user_seed_ratings), "strategies": strategies}
 
 
 def _round(d: dict) -> dict:
@@ -305,16 +516,20 @@ def _plot_history(history: dict, path: Path) -> None:
 
 
 def eval_step(cfg, ctx: dict) -> dict | None:
-    """Test RMSE + P/R/NDCG@10 for popularity, bias baseline and MF; figure cf_training.png.
+    """Test RMSE + P/R/NDCG@10 for popularity, bias baseline, MF and the ranking rules; figure cf_training.png.
 
-    Returns {"popularity", "bias_baseline", "cf_mf"} (metrics.json "rating_models" entries), or None
-    when data or CF artifacts are missing.
+    "cf_mf" ranks by predicted rating (kept as a finding: it collapses to the item bias), "cf_mf_pop"
+    by rank_scores with the validation-chosen beta, "item_knn" by kNN + gamma*log1p(count);
+    "new_users" is the simulate_new_users table. Returns these metrics.json "rating_models" entries,
+    or None when data or CF artifacts are missing.
     """
+    from . import data as data_mod
     from .metrics import rank_eval, rmse_eval
 
     models_dir = Path(ctx.get("models_dir", MODELS_DIR))
     figures_dir = Path(ctx.get("figures_dir", FIGURES_DIR))
-    needed = [models_dir / f for f in ("cf_baseline.npz", "cf_mf.npz", "popularity.npz", "cf_history.json")]
+    needed = [models_dir / f for f in ("cf_baseline.npz", "cf_mf.npz", "popularity.npz", "cf_history.json",
+                                       "item_knn.npz", "cf_ranking.json")]
     if not all(p.exists() for p in needed):
         print(f"[cf] artifacts missing in {models_dir}; skipping eval")
         return None
@@ -323,7 +538,13 @@ def eval_step(cfg, ctx: dict) -> dict | None:
         return None
 
     base, mf = load_baseline(models_dir), load_cf(models_dir)
-    pop = _load_npz(models_dir / "popularity.npz", ("score",))["score"]
+    popz = _load_npz(models_dir / "popularity.npz", ("score", "count"))
+    pop, count = popz["score"], popz["count"]
+    S, ranking = load_item_knn(models_dir), load_ranking(models_dir)
+    beta, gamma = float(ranking["beta"]), float(ranking["knn_gamma"])
+    n_users = data["stats"]["n_users"]
+    liked = liked_matrix(data["ratings"], n_users, S.shape[0],
+                         exclude_users=data_mod.flagged_indices(data["index_maps"]))
     history = json.loads((models_dir / "cf_history.json").read_text(encoding="utf-8"))
     rs = data["ratings"]
     test_df = rs[rs["split"] == "test"]
@@ -354,6 +575,12 @@ def eval_step(cfg, ctx: dict) -> dict | None:
     out["cf_mf"] = _round({"rmse": rmse_eval(mf_predict, test_df), "precision_at_10": r["precision_at_10"],
                            "recall_at_10": r["recall_at_10"], "ndcg_at_10": r["ndcg_at_10"],
                            "best_epoch": int(history["best_epoch"]), "dim": int(mf["P"].shape[1])})
+    r = rank_eval(lambda u: rank_scores(mf, mf["P"][u], mf["bu"][u], count, beta), **rank_args)
+    out["cf_mf_pop"] = _round({**_prn(r), "beta": beta})
+    lc = np.log1p(np.asarray(count, dtype=np.float32))[None, :]
+    r = rank_eval(lambda u: knn_scores(S, liked[u]) + gamma * lc, **rank_args)
+    out["item_knn"] = _round({**_prn(r), "k": int(ranking["knn_k"]), "gamma": gamma})
+    out["new_users"] = simulate_new_users(cfg, data, mf, S, pop, count, beta, gamma)
     _plot_history(history, figures_dir / "cf_training.png")
     print(f"[cf] eval ({r['n_eval_users']} ranked users): {out}")
     return out

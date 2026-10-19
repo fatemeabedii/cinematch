@@ -77,6 +77,35 @@ def test_learning_policies_beat_random():
     assert res["params"] == {"epsilon": cfg.bandit_epsilon, "alpha": cfg.bandit_alpha, "ridge": cfg.bandit_ridge}
 
 
+def test_best_fixed_arm_uses_same_sequences():
+    """Hindsight best arm = highest mean expected reward; played on the policies' user sequences."""
+    cfg = _cfg(bandit_rounds=500)
+    res = bandit.run_all(synthetic_env(), cfg)
+    fixed = res["best_fixed_arm"]
+    assert fixed["arm"] == "cluster_popular" and fixed["cum_regret"] == 0.0     # best arm for every user
+    assert fixed["mean_reward"] == pytest.approx(0.6, abs=0.03)
+    assert len(fixed["cum_regret_curve"]) == len(res["policies"]["random"]["cum_regret_curve"])
+    # contextual env: arms 0 and 1 near-tied on average; regret = sum over the SAME users as random's
+    env = contextual_env()
+    env["probs"] = env["probs"] * (1 + 0.001 * np.arange(60, dtype=np.float32))[:, None, None]  # unique oracle per user
+    env["expected"] = env["probs"].mean(axis=2)
+    res = bandit.run_all(env, cfg)
+    fixed = res["best_fixed_arm"]
+    assert fixed["arm"] == "content"                                       # group 1 is scaled up slightly more
+    regrets = []
+    for seed in cfg.bandit_seeds:
+        users = bandit.run_simulation(bandit.BanditEnv(env, np.random.default_rng(seed)),
+                                      bandit.RandomPolicy(4, np.random.default_rng(9)), cfg.bandit_rounds)
+        sim = bandit.run_simulation(bandit.BanditEnv(env, np.random.default_rng(seed)),
+                                    bandit.FixedArmPolicy(4, np.random.default_rng(9), 1), cfg.bandit_rounds)
+        np.testing.assert_array_equal(sim["oracle"], users["oracle"])           # same user sequence
+        assert (sim["arms"] == 1).all()
+        regrets.append(sim["regret"].sum())
+    assert fixed["cum_regret"] == pytest.approx(np.mean(regrets), abs=1e-3)
+    assert fixed["cum_regret_std"] == pytest.approx(np.std(regrets, ddof=1), abs=1e-3)
+    assert res["policies"]["linucb"]["cum_regret"] < fixed["cum_regret"]       # context beats any single arm
+
+
 def test_seed_std_is_sample_std_and_no_signal_fraction():
     final = np.array([1.0, 2.0, 4.0])
     assert bandit._seed_std(final) == pytest.approx(np.std(final, ddof=1))
@@ -188,8 +217,8 @@ def test_train_and_eval_step_roundtrip(tmp_path):
     assert env["user_idx"].shape == (10,) and set(env["user_idx"]) <= set(range(0, n_users, 2))
     assert list(env["arm_names"]) == bandit.ARMS and env["contexts"].shape == (10, 7)
     results = json.loads((models / "bandit_results.json").read_text(encoding="utf-8"))
-    assert set(results) == {"policies", "oracle_mean_reward", "arm_mean_expected_reward", "rounds", "n_seeds",
-                            "frac_users_no_signal", "params", "tuning", "tuning_std"}
+    assert set(results) == {"policies", "oracle_mean_reward", "arm_mean_expected_reward", "best_fixed_arm", "rounds",
+                            "n_seeds", "frac_users_no_signal", "params", "tuning", "tuning_std"}
     assert set(results["params"]) == {"epsilon", "alpha", "ridge", "tuned_on_users"}
     assert results["params"]["tuned_on_users"] == 15                      # odd users: not in eval_users.npy
     assert results["params"]["alpha"] in cfg.bandit_alpha_grid
@@ -206,6 +235,8 @@ def test_train_and_eval_step_roundtrip(tmp_path):
     assert metrics["params"] == results["params"] and metrics["tuning"] == results["tuning"]
     assert metrics["tuning_std"] == results["tuning_std"]
     assert "frac_users_no_signal" in metrics
+    assert set(metrics["best_fixed_arm"]) == {"arm", "mean_reward", "cum_regret", "cum_regret_std"}
+    assert "cum_regret_curve" in results["best_fixed_arm"]
     assert (figs / "bandit_cumulative_reward.png").exists() and (figs / "bandit_regret.png").exists()
 
 
@@ -322,3 +353,12 @@ def test_fast_config_tuning_fields(monkeypatch):
     assert (full.bandit_tune_users, full.bandit_tune_seeds) == (1000, (100, 101))
     assert (fast.bandit_tune_users, fast.bandit_tune_seeds) == (100, (100,))
     assert not set(full.bandit_tune_seeds) & set(full.bandit_seeds)
+
+
+def test_arm_labels_match_readme_fill():
+    """The app uses bandit.ARM_LABELS, the README uses readme_fill's numpy-free copy: both must agree."""
+    from cinematch import readme_fill
+
+    assert set(bandit.ARM_LABELS) == set(bandit.ARMS)
+    assert bandit.ARM_LABELS == readme_fill.ARM_LABELS
+    assert bandit.POLICY_LABELS == readme_fill.POLICY_LABELS

@@ -28,47 +28,47 @@ import plotly.graph_objects as go  # noqa: E402
 import requests  # noqa: E402
 import streamlit as st  # noqa: E402
 
-from cinematch import anomaly  # noqa: E402
+from cinematch import anomaly, bandit  # noqa: E402
+from cinematch.clustering import MAINSTREAM_PP  # noqa: E402
 from cinematch.config import (  # noqa: E402
     FIGURES_DIR, MODELS_DIR, PROCESSED_DIR, RELEVANT_THRESHOLD, REPORTS_DIR, get_config,
 )
+from cinematch.recommend import MODEL_FILES, PROCESSED_FILES, ModelsMissingError, Recommender  # noqa: E402
 
-try:  # recommend.py / bandit.py are numpy-only; guard so a partial checkout still renders a message
-    from cinematch.recommend import MODEL_FILES, PROCESSED_FILES, ModelsMissingError, Recommender
-except ImportError:  # pragma: no cover - only when the package is incomplete
-    Recommender = None
-    MODEL_FILES, PROCESSED_FILES = ("cf_mf.npz",), ()
-
-    class ModelsMissingError(FileNotFoundError):
-        """Placeholder used when cinematch.recommend is not available."""
-try:
-    from cinematch import bandit
-except ImportError:  # pragma: no cover
-    bandit = None
-
-REPO_URL = "https://github.com/<user>/cinematch"
+# Public repository link for the sidebar; the link is hidden when the variable is not set.
+REPO_URL = os.environ.get("CINEMATCH_REPO_URL", "").strip()
 RUN_INSTRUCTIONS = (
     "python scripts/download_data.py\n"
     "python scripts/train_all.py\n"
     "python scripts/evaluate.py"
 )
 METRICS_PATH = REPORTS_DIR / "metrics.json"
-STRATEGIES = {"Collaborative filtering (MF)": "cf", "Content (two-tower)": "content", "Hybrid": "hybrid"}
+# Rate-movies strategies (label -> recommend_from_ratings strategy); the first one is the default.
+# Item-kNN is the default: it stays personal with only a few ratings and its "why" is literally true.
+STRATEGIES = {"Similar movies (item-kNN)": "knn", "Matrix factorization": "cf", "Content (two-tower)": "content"}
 # Display label per bandit policy key (bandit.POLICY_NAMES); also used for the metrics.json table.
-POLICY_LABELS = getattr(bandit, "POLICY_LABELS", {"random": "Random", "epsilon_greedy": "Epsilon-greedy",
-                                                  "linucb": "LinUCB"})
-# What the card score means per strategy (recommend.py: cf/content = predicted rating clipped to 1..5,
-# hybrid = mean of per-model z-scores (only meaningful relative to the other movies in the list),
-# cluster = profile score with a popularity bonus, not a rating).
-SCORE_LABELS = {"cf": "predicted rating", "content": "predicted rating", "hybrid": "relative score",
-                "cluster": "profile score"}
+POLICY_LABELS = bandit.POLICY_LABELS
+# The Bandit Lab slider goes up to the full evaluation horizon, but the live default is capped so a run
+# takes a few seconds.
+MAX_LIVE_ROUNDS = 20_000
+DEFAULT_LIVE_ROUNDS_CAP = 5_000
+# Display names of the bandit arms (bandit.ARMS).
+ARM_LABELS = bandit.ARM_LABELS
 # Alpha values offered in the Bandit Lab (log-like spacing; the tuned value is always added).
 ALPHA_OPTIONS = (0.0, 0.01, 0.03, 0.1, 0.3, 0.5, 1.0, 2.0, 3.0)
 MODEL_LABELS = {
     "popularity": "Popularity",
     "bias_baseline": "Bias baseline",
-    "cf_mf": "Matrix factorization (CF)",
+    "cf_mf": "Matrix factorization (ranked by predicted rating)",
+    "cf_mf_pop": "MF + popularity prior",
+    "item_knn": "Item-kNN",
     "two_tower": "Two-tower content model",
+}
+NEW_USER_LABELS = {
+    "popularity": "Popularity",
+    "mf_foldin": "MF fold-in (ranked by predicted rating)",
+    "mf_foldin_pop": "MF fold-in + popularity prior",
+    "item_knn": "Item-kNN on the liked seed movies",
 }
 
 
@@ -90,8 +90,6 @@ def _recommender_stamp() -> tuple:
 @st.cache_resource(show_spinner="Loading models...", max_entries=1)
 def get_recommender(stamp: tuple):
     """The numpy Recommender, cached per artifact stamp. Raises ModelsMissingError (never cached)."""
-    if Recommender is None:
-        raise ModelsMissingError("cinematch.recommend is not available")
     return Recommender(MODELS_DIR, PROCESSED_DIR)
 
 
@@ -130,7 +128,7 @@ def popular_movies(n: int = 30) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, max_entries=4)
 def _bandit_env(stamp: tuple) -> dict | None:
-    if bandit is None or not (MODELS_DIR / "bandit_env.npz").exists():
+    if not (MODELS_DIR / "bandit_env.npz").exists():
         return None
     try:
         return bandit.load_env(MODELS_DIR)
@@ -241,15 +239,23 @@ def _fmt(value, digits: int = 4) -> str:
     return "n/a" if value is None else f"{float(value):.{digits}f}"
 
 
+def _stands_out(top_genres) -> bool:
+    """False for a "Mainstream" profile: its top genre is over-represented by < MAINSTREAM_PP points."""
+    return bool(len(top_genres)) and float(top_genres[0][1]) >= MAINSTREAM_PP
+
+
 def _genres_pp(top_genres, n: int = 3) -> str:
-    """[[genre, pp], ...] -> 'Drama +4.1 pp, Film-Noir +2.0 pp' (over-representation vs all users)."""
+    """[[genre, pp], ...] -> 'Drama +7.6 pp, Film-Noir +1.4 pp' (over-representation vs all users)."""
+    if not _stands_out(top_genres):
+        return "no genre stands out"
     return ", ".join(f"{g} {float(v):+.1f} pp" for g, v in list(top_genres)[:n])
 
 
-def movie_cards(df: pd.DataFrame, score_label: str | None = "predicted rating", per_row: int = 5) -> None:
-    """Render recommendations as poster cards (title, genres, score, why).
+def movie_cards(df: pd.DataFrame, per_row: int = 5) -> None:
+    """Render recommendations as poster cards (title, genres, why), best first.
 
-    `score_label` names what the score means for this strategy (scales differ); None hides it.
+    No number is shown: every strategy's score is only meaningful for ordering (kNN similarities and
+    popularity-boosted scores are not ratings), so the cards just keep the order.
     """
     if df is None or len(df) == 0:
         st.info("No recommendations available.")
@@ -261,25 +267,31 @@ def movie_cards(df: pd.DataFrame, score_label: str | None = "predicted rating", 
             title = str(row.get("title", ""))
             poster = get_poster_url(title, row.get("year")) or placeholder_poster(title)
             genres = str(row.get("genres", "")).replace("|", " · ")
-            score = row.get("score")
-            show = score_label and score is not None and np.isfinite(score)
-            score_txt = f"{score_label} {float(score):.2f}" if show else ""
             why = html.escape(str(row.get("why", "") or ""))
             col.markdown(
                 f'<img src="{html.escape(poster, quote=True)}" alt="" style="width:100%;aspect-ratio:2/3;object-fit:cover;'
                 f'border-radius:8px;">'
                 f'<div style="font-weight:600;margin-top:6px;line-height:1.25">{html.escape(title)}</div>'
                 f'<div style="font-size:0.8em;opacity:0.75">{html.escape(genres)}</div>'
-                f'<div style="font-size:0.8em;opacity:0.75">{score_txt}</div>'
                 f'<div style="font-size:0.8em;font-style:italic;opacity:0.85">{why}</div>',
                 unsafe_allow_html=True,
             )
+    st.caption("Cards are ordered best first.")
 
 
 # ----------------------------------------------------------------------------- tab 1
+def _explain(rec, strategy: str) -> str | None:
+    """The Recommender's plain-English description of a strategy, or None if it has none."""
+    try:
+        return rec.explain(strategy)
+    except (ValueError, KeyError):
+        return None
+
+
 def _rating_form(rec) -> None:
     movies = popular_movies(30)
-    st.caption("Rate at least 3 movies you know (leave the rest on *skip*), pick a model, then hit Recommend.")
+    st.caption("Rate at least 3 movies you know (leave the rest on *skip*), pick a model, then hit Recommend. "
+               "Similar movies (item-kNN) works best with a few ratings of 4 or 5 stars.")
     with st.form("rate_form"):
         cols = st.columns(3)
         for j, row in enumerate(movies.to_dict("records")):
@@ -314,21 +326,21 @@ def _rating_form(rec) -> None:
         cid = result["cluster"]
         if 0 <= cid < len(names):
             st.success(f"You look like: **{names[cid]}**  (based on your {result['n_rated']} ratings)")
-        st.caption(rec.explain(result["strategy"]))
-        if result["strategy"] == "hybrid":
-            st.caption("Relative score = average of the CF and content z-scores: it ranks movies against each "
-                       "other and is not a star rating.")
-        movie_cards(result["df"], SCORE_LABELS.get(result["strategy"]))
+        explanation = _explain(rec, result["strategy"])
+        if explanation:
+            st.caption(explanation)
+        movie_cards(result["df"])
 
 
 def _profile_picker(rec) -> None:
     cl = rec.cl
     names = list(cl["names"])
     top = cl.get("top_genres") or [[] for _ in names]
-    labels = [f"{n} ({_genres_pp(t, 2)})" if len(t) else n for n, t in zip(names, top)]
+    labels = [f"{n} ({_genres_pp(t, 2)})" if _stands_out(t) else n for n, t in zip(names, top)]
     cid = st.selectbox("Taste profile", range(len(names)), format_func=lambda c: labels[c], key="profile_pick")
-    st.caption("Cold-start for a brand-new user: no ratings needed, we serve the profile's favourites.")
-    movie_cards(rec.recommend_for_cluster(int(cid), 10), SCORE_LABELS["cluster"])
+    st.caption("Cold-start for a brand-new user: no ratings needed, we serve the profile's favourites "
+               "(best first). pp = percentage points above the average user's share of ratings in that genre.")
+    movie_cards(rec.recommend_for_cluster(int(cid), 10))
 
 
 def tab_recommend(rec) -> None:
@@ -369,13 +381,13 @@ def tab_profiles(rec) -> None:
         "Profile": names,
         "Users": sizes,
         "Share": [f"{100 * s / total:.0f}%" for s in sizes],
-        "Over-represented genres (vs all users)": [_genres_pp(t, 3) for t in top],
+        "Over-represented genres (percentage points vs all users)": [_genres_pp(t, 3) for t in top],
     })
     st.dataframe(table, hide_index=True)
 
     cid = st.selectbox("Top movies for profile", range(len(names)), format_func=lambda c: names[c],
                        key="explore_pick")
-    movie_cards(rec.recommend_for_cluster(int(cid), 10), SCORE_LABELS["cluster"])
+    movie_cards(rec.recommend_for_cluster(int(cid), 10))
 
     figs = [p for p in (FIGURES_DIR / "elbow.png", FIGURES_DIR / "silhouette.png") if p.exists()]
     if figs:
@@ -436,16 +448,16 @@ def tab_bandit() -> None:
         st.info("The bandit simulator has not been built yet (models/bandit_env.npz missing). "
                 "Run `python scripts/train_all.py` to create it.")
         return
-    arm_names = [str(a) for a in env_dict.get("arm_names", getattr(bandit, "ARMS", []))]
+    arm_names = [str(a) for a in env_dict.get("arm_names", bandit.ARMS)]
 
     cfg = get_config()
     defaults = bandit_defaults()
     default_eps = round(min(max(defaults["epsilon"], 0.0), 0.5), 2)
-    alpha_options = sorted({*ALPHA_OPTIONS, *getattr(cfg, "bandit_alpha_grid", ()), defaults["alpha"]})
+    alpha_options = sorted({*ALPHA_OPTIONS, *cfg.bandit_alpha_grid, defaults["alpha"]})
     with st.form("bandit_form"):
         c1, c2 = st.columns(2)
-        default_rounds = int(min(max(round(cfg.bandit_rounds / 100) * 100, 100), 3000))
-        rounds = c1.slider("Rounds", 100, 3000, default_rounds, step=100, key="bandit_rounds")
+        default_rounds = int(min(max(round(cfg.bandit_rounds / 100) * 100, 100), DEFAULT_LIVE_ROUNDS_CAP))
+        rounds = c1.slider("Rounds", 100, MAX_LIVE_ROUNDS, default_rounds, step=100, key="bandit_rounds")
         seed = c1.number_input("Seed", min_value=0, max_value=10_000, value=0, step=1, key="bandit_seed")
         epsilon = c2.slider("Epsilon (epsilon-greedy exploration rate)", 0.0, 0.5, default_eps, step=0.01,
                             key="bandit_epsilon")
@@ -455,6 +467,8 @@ def tab_bandit() -> None:
                                 format_func=lambda k: POLICY_LABELS.get(k, k), key="bandit_policies")
         run = st.form_submit_button("Run simulation", type="primary")
     st.caption(_defaults_note(defaults))
+    st.caption(f"The reported results (How It Works, README) use {cfg.bandit_rounds:,} rounds per seed; the live "
+               f"default is capped at {DEFAULT_LIVE_ROUNDS_CAP:,} rounds so a run takes a few seconds.")
 
     if run:
         if not chosen:
@@ -493,12 +507,16 @@ PIPELINE_MD = """
    excluded from training so they cannot distort the models.
 2. **Collaborative filtering (core).** Matrix factorization (user/item vectors + biases, regularized MSE,
    PyTorch + Adam, early stopping on validation RMSE), compared against a bias baseline and popularity.
+   Ranking by predicted rating mostly follows each movie's average rating, so top-10 lists add a popularity
+   prior to the MF score, and an item-kNN ranker scores movies by cosine similarity to the ones you liked.
+   The prior weight and the number of neighbours are chosen on the validation split.
 3. **Two-tower content model (cold-start movies).** Genres, year and title embeddings for movies; rating-derived
    profiles for users. It can score movies nobody has rated yet, which MF cannot.
 4. **Taste profiles (cold-start users).** K-means on the MF user vectors gives named segments, so a new
    user can pick a profile instead of rating anything.
 5. **Contextual bandit.** LinUCB learns which recommender to use for which kind of user, scored by a click
-   simulator built from held-out ratings, against epsilon-greedy and random.
+   simulator built from held-out ratings, against epsilon-greedy, random and always serving the best single
+   strategy (chosen in hindsight).
 """
 BANDIT_TUNED_MD = """   Exploration settings are tuned on simulated users disjoint from the evaluated ones.
 """
@@ -506,18 +524,38 @@ DQN_STEP_MD = """6. **DQN (stretch goal).** A small deep Q-network learns in whi
    where later slots and repeated genres lower the click probability.
 """
 PIPELINE_FOOTER_MD = """
-The app runs on **numpy only**: weights are exported to `.npz` and new users are folded in with closed-form
-ridge regression against the frozen movie vectors.
+The app runs on **numpy only**: weights and the sparse item-item similarity matrix are exported to `.npz`;
+new users are folded in with closed-form ridge regression against the frozen movie vectors (MF) or scored
+directly from the movies they rated 4 or 5 (item-kNN). Cards show no score, only the order.
 """
 
 
+def _model_label(key: str, m: dict) -> str:
+    """Warm-table label; the ranking rows show their validation-chosen hyperparameter."""
+    if key == "cf_mf_pop" and m.get("beta") is not None:
+        return f"{MODEL_LABELS[key]} (beta = {float(m['beta']):g})"
+    if key == "item_knn" and m.get("k") is not None:
+        return f"{MODEL_LABELS[key]} (k = {int(m['k'])})"
+    return MODEL_LABELS[key]
+
+
 def _ranking_table(rm: dict) -> pd.DataFrame | None:
+    """Warm-movie results; only MODEL_LABELS keys (never cold_baselines / new_users)."""
     rows = []
-    for key, label in MODEL_LABELS.items():
+    for key in MODEL_LABELS:
         m = rm.get(key)
         if m:
-            rows.append({"Model": label, "RMSE": m.get("rmse"), "P@10": m.get("precision_at_10"),
+            rows.append({"Model": _model_label(key, m), "RMSE": m.get("rmse"), "P@10": m.get("precision_at_10"),
                          "R@10": m.get("recall_at_10"), "NDCG@10": m.get("ndcg_at_10")})
+    return pd.DataFrame(rows) if rows else None
+
+
+def _new_user_table(rm: dict) -> pd.DataFrame | None:
+    """Simulated new users (rating_models.new_users), or None when it was not evaluated."""
+    strategies = (rm.get("new_users") or {}).get("strategies") or {}
+    rows = [{"Strategy": NEW_USER_LABELS.get(key, key), "P@10": (m or {}).get("precision_at_10"),
+             "R@10": (m or {}).get("recall_at_10"), "NDCG@10": (m or {}).get("ndcg_at_10")}
+            for key, m in strategies.items()]
     return pd.DataFrame(rows) if rows else None
 
 
@@ -532,6 +570,11 @@ def _cold_table(rm: dict) -> pd.DataFrame | None:
     if base.get("user_bias"):
         rows.append({"Model": "User-bias baseline (best CF can do)", "RMSE": base["user_bias"].get("rmse"),
                      "P@10": None, "R@10": None, "NDCG@10": None})
+    if base.get("genre_popularity"):
+        gp = base["genre_popularity"]
+        rows.append({"Model": "Genre popularity (non-personalized)", "RMSE": None,
+                     "P@10": gp.get("precision_at_10"), "R@10": gp.get("recall_at_10"),
+                     "NDCG@10": gp.get("ndcg_at_10")})
     if base.get("random"):
         r = base["random"]
         rows.append({"Model": "Random ranking", "RMSE": None, "P@10": r.get("precision_at_10"),
@@ -540,7 +583,7 @@ def _cold_table(rm: dict) -> pd.DataFrame | None:
 
 
 def _show_table(df: pd.DataFrame) -> None:
-    cols = [c for c in df.columns if c != "Model"]
+    cols = [c for c in df.columns if c not in ("Model", "Strategy")]
     st.dataframe(df.style.format({c: lambda v: _fmt(v) for c in cols}, na_rep="n/a"), hide_index=True)
 
 
@@ -560,29 +603,53 @@ def _data_sentence(metrics: dict) -> str:
 
 def _headline(metrics: dict) -> None:
     rm = metrics.get("rating_models") or {}
-    tiles = []
+    tiles = []                          # (label, value, delta, delta_color)
     mf, base = rm.get("cf_mf") or {}, rm.get("bias_baseline") or {}
     if mf.get("rmse") is not None:
         delta = None if base.get("rmse") is None else f"{mf['rmse'] - base['rmse']:+.4f} vs bias baseline"
-        tiles.append(("MF test RMSE", _fmt(mf["rmse"]), delta))
+        tiles.append(("MF test RMSE", _fmt(mf["rmse"]), delta, "inverse"))      # lower is better
+    knn, pop = (rm.get("item_knn") or {}).get("ndcg_at_10"), (rm.get("popularity") or {}).get("ndcg_at_10")
+    if knn is not None:
+        delta = None if pop is None else f"{knn - pop:+.4f} vs popularity"
+        tiles.append(("Top-10 NDCG@10 (item-kNN)", _fmt(knn), delta, "normal"))
     cold = (rm.get("two_tower") or {}).get("cold") or {}
     if cold.get("ndcg_at_10") is not None:
-        tiles.append(("Cold-start NDCG@10", _fmt(cold["ndcg_at_10"]), None))
+        cold_base = rm.get("cold_baselines") or {}
+        rnd = (cold_base.get("random") or {}).get("ndcg_at_10")
+        genre_pop = (cold_base.get("genre_popularity") or {}).get("ndcg_at_10")
+        parts = [f"{cold['ndcg_at_10'] - ref:+.4f} vs {name}"
+                 for ref, name in ((rnd, "random ranking"), (genre_pop, "genre popularity")) if ref is not None]
+        delta = "; ".join(parts) or None
+        tiles.append(("Cold-start NDCG@10", _fmt(cold["ndcg_at_10"]), delta, "normal"))
     an = metrics.get("anomaly") or {}
     if an.get("test_f1") is not None:
-        tiles.append(("Bot detection F1 (test)", _fmt(an["test_f1"]), None))
-    pol = ((metrics.get("bandit") or {}).get("policies") or {})
+        tiles.append(("Bot detection F1 (synthetic bots)", _fmt(an["test_f1"]), None, "off"))
+    bd = metrics.get("bandit") or {}
+    pol = bd.get("policies") or {}
     if (pol.get("linucb") or {}).get("cum_regret") is not None and (pol.get("random") or {}).get("cum_regret"):
-        ratio = pol["linucb"]["cum_regret"] / pol["random"]["cum_regret"]
-        tiles.append(("LinUCB regret vs random", f"{100 * ratio:.0f}%", None))
+        linucb = pol["linucb"]["cum_regret"]
+        change = 1 - linucb / pol["random"]["cum_regret"]
+        delta = "vs random policy"
+        fixed = (bd.get("best_fixed_arm") or {}).get("cum_regret")
+        if fixed is not None:
+            verdict = "beats" if linucb < fixed else "does not beat"
+            delta += f"; {verdict} the best single strategy (hindsight)"
+        tiles.append(("LinUCB regret", f"{100 * abs(change):.0f}% {'lower' if change >= 0 else 'higher'}",
+                      delta, "off"))
     if tiles:
-        for col, (label, value, delta) in zip(st.columns(len(tiles)), tiles):
-            col.metric(label, value, delta, delta_color="inverse")
+        for col, (label, value, delta, color) in zip(st.columns(len(tiles)), tiles):
+            col.metric(label, value, delta, delta_color=color)
 
 
 def _bandit_note(bd: dict) -> str:
-    """Tuned hyperparameters and the share of simulated users without any click signal."""
+    """Best single strategy verdict, tuned hyperparameters and the share of users without click signal."""
     parts = []
+    fixed = bd.get("best_fixed_arm") or {}
+    linucb = ((bd.get("policies") or {}).get("linucb") or {}).get("cum_regret")
+    if fixed.get("cum_regret") is not None and linucb is not None:
+        arm = ARM_LABELS.get(fixed.get("arm"), fixed.get("arm", "n/a"))
+        verdict = "beats" if linucb < fixed["cum_regret"] else "does not beat"
+        parts.append(f"LinUCB {verdict} always serving the best single strategy ({arm}, chosen in hindsight).")
     params = bd.get("params") or {}
     if params.get("epsilon") is not None and params.get("alpha") is not None:
         txt = f"Epsilon {params['epsilon']:g}, alpha {params['alpha']:g}"
@@ -621,8 +688,22 @@ def _results(metrics: dict) -> None:
     if table is not None:
         st.markdown("**Warm movies** (test split)")
         _show_table(table)
-        st.caption("Popularity has no rating prediction (RMSE n/a). It can beat MF on top-N in MovieLens; "
-                   "MF here is tuned for RMSE. Reported as measured.")
+        caption = "Popularity has no rating prediction (RMSE n/a)."
+        if rm.get("cf_mf_pop") or rm.get("item_knn"):
+            caption += (" MF + popularity prior is the same MF model, ranked by predicted rating + beta x log(1 + "
+                        "number of ratings); item-kNN scores a movie by its similarity to the movies you liked "
+                        "and predicts no rating. beta, k and the kNN popularity weight are chosen on the "
+                        "validation split.")
+        st.caption(caption + " Reported as measured.")
+    new_users = _new_user_table(rm)
+    if new_users is not None:
+        nu = rm["new_users"]
+        st.markdown(f"**New users** (simulated, {nu.get('n_seed_ratings', 'n/a')} known ratings; test split)")
+        _show_table(new_users)
+        n_users = nu.get("n_users")
+        who = "Sampled users" if n_users is None else f"{int(n_users):,} sampled users"
+        st.caption(f"{who} keep only a few random ratings of well-known movies and are scored exactly as this "
+                   "app scores a new user; this is the evaluation that matches the Rate movies flow.")
     cold = _cold_table(rm)
     if cold is not None:
         st.markdown("**Cold-start movies** (never seen in training)")
@@ -656,6 +737,12 @@ def _results(metrics: dict) -> None:
         st.markdown(f"**Contextual bandit** ({bd.get('rounds', 0):,} rounds x {bd.get('n_seeds', 0)} seeds)")
         rows = [{"Model": POLICY_LABELS.get(name, name), "Mean reward": p.get("mean_reward"), "Cumulative regret": p.get("cum_regret"),
                  "Regret std": p.get("cum_regret_std")} for name, p in (bd.get("policies") or {}).items()]
+        fixed = bd.get("best_fixed_arm")
+        if fixed:
+            arm = ARM_LABELS.get(fixed.get("arm"), fixed.get("arm", "n/a"))
+            rows.append({"Model": f"Always {arm} (best single strategy in hindsight; reference)",
+                         "Mean reward": fixed.get("mean_reward"), "Cumulative regret": fixed.get("cum_regret"),
+                         "Regret std": fixed.get("cum_regret_std")})
         if rows:
             _show_table(pd.DataFrame(rows))
         note = _bandit_note(bd)
@@ -677,6 +764,14 @@ ABLATION_LABELS = {
 DQN_LABELS = {"dqn": "DQN (greedy policy)", "greedy_cf": "CF order", "diversity_heuristic": "Diversity heuristic",
               "random": "Random order"}
 
+FEATURE_LABELS = {
+    "log_count": "Number of ratings (log)",
+    "mean_rating": "Average rating",
+    "var_rating": "Rating variance",
+    "pct_extreme": "Share of 1/5-star ratings",
+    "log_ratings_per_day": "Ratings per day (log)",
+    "mean_abs_item_dev": "Distance from movie averages",
+}
 FEATURE_HELP = {
     "log_count": "log(1 + number of ratings)",
     "mean_rating": "average star rating",
@@ -709,8 +804,8 @@ def _anomaly_demo() -> None:
     base = typical if preset == "Average real user" else {f: PUSH_BOT.get(f, typical[f]) for f in features}
     cols = st.columns(3)
     values = [
-        cols[j % 3].number_input(f, value=round(base[f], 3), step=0.05, format="%.3f",
-                                 help=FEATURE_HELP.get(f), key=f"anom_{preset}_{f}")
+        cols[j % 3].number_input(FEATURE_LABELS.get(f, f), value=round(base[f], 3), step=0.05, format="%.3f",
+                                 help=f"{FEATURE_HELP.get(f, f)} (feature `{f}`)", key=f"anom_{preset}_{f}")
         for j, f in enumerate(features)
     ]
     score, eps = anomaly.score_user(model, np.array(values, dtype=np.float64)), float(model["eps"])
@@ -752,10 +847,11 @@ def sidebar() -> None:
     with st.sidebar:
         st.title("CineMatch")
         st.markdown(
-            "A MovieLens-1M recommender that combines **anomaly detection**, **matrix factorization**, a "
-            "**two-tower content model**, **K-means taste profiles** and a **contextual bandit**."
+            "A MovieLens-1M recommender that combines **anomaly detection**, **matrix factorization** and "
+            "**item-kNN**, a **two-tower content model**, **K-means taste profiles** and a **contextual bandit**."
         )
-        st.markdown(f"[Source code on GitHub]({REPO_URL})")
+        if REPO_URL:
+            st.markdown(f"[Source code on GitHub]({REPO_URL})")
         if os.environ.get("TMDB_API_KEY"):
             st.caption("Posters: TMDB (API key found).")
         else:

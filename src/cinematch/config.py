@@ -25,6 +25,7 @@ ML1M_EXPECTED_FILES = ("ratings.dat", "movies.dat", "users.dat")
 
 SEED = 42
 TOP_K = 10
+TORCH_THREADS = 8  # fixed for reproducibility, see set_seed
 RELEVANT_THRESHOLD = 4  # rating >= 4 is relevant
 GENRES = ["Action", "Adventure", "Animation", "Children's", "Comedy", "Crime", "Documentary", "Drama",
           "Fantasy", "Film-Noir", "Horror", "Musical", "Mystery", "Romance", "Sci-Fi", "Thriller", "War",
@@ -58,6 +59,14 @@ class Config:
     cf_batch: int = 4096
     cf_epochs: int = 30
     cf_patience: int = 3
+    # CF ranking (all chosen on the VALIDATION split by NDCG@10 inside cf.train_step, never on test)
+    cf_rank_pop_betas: tuple = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)  # MF rank score + beta*log1p(train count)
+    knn_neighbors: tuple = (50, 100, 200)    # item-kNN: neighbours kept per item
+    knn_pop_gammas: tuple = (0.0, 0.25, 0.5)  # item-kNN rank score + gamma*log1p(train count)
+    # new users (app "rate a few movies" flow) and its offline simulation
+    new_user_min_train_ratings: int = 100   # warm items need this many train ratings to be shown to new users
+    new_user_seed_ratings: int = 5          # ratings a simulated new user gives
+    new_user_eval_users: int = 1000         # eval users replayed as new users
     # two-tower
     tt_hidden: int = 64
     tt_dim: int = 32
@@ -73,8 +82,12 @@ class Config:
     k_cap: int = 8
     k_min_cluster_frac: float = 0.03
     cluster_name_top_n_movies: int = 300
+    cluster_taste_weight: float = 2.0       # profile score = mu + bi + w_taste*(Q @ centroid) + w_pop*log1p(count)
+    cluster_pop_weight: float = 0.5
     # bandit
-    bandit_rounds: int = 3000
+    # rewards are only a few percent: with 1,000 users, 3,000 rounds is ~3 visits per user, too short
+    # for any policy to separate the arms
+    bandit_rounds: int = 20000
     bandit_seeds: tuple = (0, 1, 2, 3, 4)
     bandit_users: int = 1000                # eval users sampled for the simulator
     bandit_epsilon: float = 0.1
@@ -120,6 +133,10 @@ class Config:
             self.anomaly_bots_per_type = 20
             self.dqn_episodes = 200
             self.dqn_eval_every = 50
+            self.new_user_eval_users = 100
+            self.cf_rank_pop_betas = (0.0, 1.0)
+            self.knn_neighbors = (50,)
+            self.knn_pop_gammas = (0.0, 0.5)
 
 
 def get_config(fast: bool | None = None) -> Config:
@@ -134,7 +151,13 @@ def ensure_dirs() -> None:
 
 
 def set_seed(seed: int = SEED) -> None:
-    """Seed python, numpy and torch. Torch is imported lazily so this module never loads it at import."""
+    """Seed python, numpy and torch, and pin torch to TORCH_THREADS threads.
+
+    Torch is imported lazily so this module never loads it at import. The thread count is pinned
+    because float reductions depend on it: results are bit-reproducible only with the same torch
+    build and TORCH_THREADS (a different OS or torch build regenerates slightly different two-tower and
+    bandit numbers).
+    """
     random.seed(seed)
     np.random.seed(seed)
     try:
@@ -142,4 +165,4 @@ def set_seed(seed: int = SEED) -> None:
     except ImportError:  # pragma: no cover - torch is a hard dependency, but keep config usable without it
         return
     torch.manual_seed(seed)
-    torch.set_num_threads(8)
+    torch.set_num_threads(TORCH_THREADS)

@@ -119,15 +119,12 @@ def build_session_data(env: dict, genre_multi_hot: np.ndarray, click_unrated: fl
 
 
 def _valid(data: dict) -> np.ndarray:
-    """[n, 8] bool real-candidate mask (all True when `data` carries no "valid" entry)."""
-    v = data.get("valid")
-    return np.ones(np.shape(data["p"]), bool) if v is None else np.asarray(v, bool)
+    """[n, 8] bool real-candidate mask (data["valid"], as built by `build_session_data`)."""
+    return np.asarray(data["valid"], bool)
 
 
-def _blocked(used: np.ndarray, valid: np.ndarray | None) -> np.ndarray:
+def _blocked(used: np.ndarray, valid: np.ndarray) -> np.ndarray:
     """Slots a policy may not pick now: already shown, or padded while a real candidate is left."""
-    if valid is None:
-        return used
     blocked = used | ~valid
     exhausted = blocked.all(axis=-1, keepdims=True)
     return np.where(exhausted, used, blocked)
@@ -151,16 +148,14 @@ def greedy_cf_orders(n: int) -> np.ndarray:
     return np.tile(np.arange(SESSION_LEN), (n, 1))
 
 
-def random_orders(n: int, seed: int, valid: np.ndarray | None = None) -> np.ndarray:
+def random_orders(n: int, seed: int, valid: np.ndarray) -> np.ndarray:
     """One uniformly random order of 5 distinct slots per user (padded slots, if any, last)."""
     rng = np.random.default_rng(seed)
-    key = rng.random((n, N_CAND))
-    if valid is not None:
-        key = key + (~np.asarray(valid, bool))   # keys are < 1, so invalid slots sort after valid ones
+    key = rng.random((n, N_CAND)) + (~np.asarray(valid, bool))   # keys < 1: invalid slots sort last
     return np.argsort(key, axis=1, kind="stable")[:, :SESSION_LEN]
 
 
-def diversity_orders(share: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
+def diversity_orders(share: np.ndarray, valid: np.ndarray) -> np.ndarray:
     """At each step pick the unused slot with the smallest genre overlap; ties -> best CF rank.
 
     Padded slots (valid False) are picked only once no real candidate is left.
@@ -234,7 +229,7 @@ def q_values_np(weights: dict, states: np.ndarray) -> np.ndarray:
     return h
 
 
-def policy_orders(q_fn, genres: np.ndarray, valid: np.ndarray | None = None) -> np.ndarray:
+def policy_orders(q_fn, genres: np.ndarray, valid: np.ndarray) -> np.ndarray:
     """Greedy rollout of a Q-function: at each step the unused slot with the highest Q-value.
 
     `q_fn(states [n, STATE_DIM]) -> [n, 8]`. Transitions are deterministic, so one rollout per user

@@ -94,6 +94,10 @@ def split_ratings(ratings: pd.DataFrame, movies: pd.DataFrame, cfg,
                   flagged_user_ids: list[int]) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """Cold-item holdout + per-user time-aware split + index maps (spec 4.3 steps 3-5).
 
+    The split is time-ordered within each user, not globally: train contains other users' ratings
+    made after a given user's test period, so train-derived popularity/trending features can use
+    information from after that period. A global-timestamp split would be stricter.
+
     Returns (ratings_split, movies_out, index_maps). Flagged users keep their rows and index;
     they are only excluded from model fitting downstream. `mean_train_rating` is NaN for movies
     without train ratings.

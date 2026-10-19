@@ -339,6 +339,25 @@ def _random_scorer(seed: int, n_items: int):
     return lambda users: rng.random((len(users), n_items))
 
 
+def genre_popularity_scores(data: dict) -> np.ndarray:
+    """Non-personalised item scores [I]: mean over the item's genres of genre_pop[g].
+
+    genre_pop[g] = mean number of TRAIN ratings per warm movie having genre g. Only train ratings of
+    warm movies and item genres are used (never cold ratings); items without a genre score 0.
+    """
+    G = np.asarray(data["item_features"]["genre_multi_hot"], dtype=np.float64)    # [I, 18]
+    warm = np.asarray(data["warm_mask"], dtype=bool)
+    rs = data["ratings"]
+    train_i = rs.loc[rs["split"] == "train", "i"].to_numpy().astype(np.int64)
+    train_i = train_i[warm[train_i]]
+    n_train = np.bincount(train_i, minlength=len(warm)).astype(np.float64)      # [I], 0 for cold items
+    n_warm_with_g = G[warm].sum(axis=0)
+    genre_pop = np.where(n_warm_with_g > 0, (G[warm] * n_train[warm][:, None]).sum(axis=0)
+                         / np.maximum(n_warm_with_g, 1), 0.0)
+    n_genres = G.sum(axis=1)
+    return np.where(n_genres > 0, G @ genre_pop / np.maximum(n_genres, 1), 0.0)
+
+
 def cold_baselines(cfg, data: dict, models_dir=MODELS_DIR) -> dict:
     """Reference points for the two-tower cold-start numbers (spec 17.5).
 
@@ -346,7 +365,11 @@ def cold_baselines(cfg, data: dict, models_dir=MODELS_DIR) -> dict:
       cf_baseline.npz (item bias unknown -> 0), RMSE on all cold rows; ``rmse`` is None when
       cf_baseline.npz is missing.
     - ``random``: mean P/R/NDCG@10 over seeds cfg.seed .. cfg.seed+9 of uniform-random scores, with
-      exactly the same eval users, cold candidates and protocol as the two-tower cold ranking.
+      exactly the same eval users, cold candidates and protocol as the two-tower cold ranking;
+      ``n_seeds`` records how many seeds were averaged.
+    - ``genre_popularity``: P/R/NDCG@10 of the same score for every user (`genre_popularity_scores`),
+      same protocol, eval users and cold candidates. It answers "how much of the two-tower's
+      cold-start lift is just genre/popularity prior".
     """
     from .metrics import rank_eval, rmse_eval
 
@@ -361,20 +384,27 @@ def cold_baselines(cfg, data: dict, models_dir=MODELS_DIR) -> dict:
     warm_mask = np.asarray(data["warm_mask"], dtype=bool)
     n_items = len(warm_mask)
     eval_users = np.asarray(data["eval_users"])
-    batch = getattr(cfg, "eval_rank_batch", 256)
+    batch = cfg.eval_rank_batch
     runs = [rank_eval(_random_scorer(seed, n_items), eval_users, data["holdout_cold"],
                       data["train_items"], ~warm_mask, TOP_K, batch)
             for seed in range(cfg.seed, cfg.seed + N_RANDOM_SEEDS)]
     n_eval = int(runs[0]["n_eval_users"])    # identical for every seed (relevance does not depend on scores)
     rand = {k: (_r4(np.mean([r[k] for r in runs])) if n_eval else None) for k in _RANK_KEYS}
-    return {"user_bias": {"rmse": _r4(bias_rmse)}, "random": {**rand, "n_eval_users": n_eval}}
+
+    pop = genre_popularity_scores(data)
+    gp = rank_eval(lambda users: np.tile(pop, (len(users), 1)), eval_users, data["holdout_cold"],
+                   data["train_items"], ~warm_mask, TOP_K, batch)
+    genre_pop = {k: (_r4(gp[k]) if n_eval else None) for k in _RANK_KEYS}
+    return {"user_bias": {"rmse": _r4(bias_rmse)},
+            "random": {**rand, "n_eval_users": n_eval, "n_seeds": N_RANDOM_SEEDS},
+            "genre_popularity": {**genre_pop, "n_eval_users": int(gp["n_eval_users"])}}
 
 
 def eval_step(cfg, ctx: dict) -> dict | None:
     """Warm test RMSE + P/R/NDCG@10 and cold-item RMSE + P/R/NDCG@10; figure two_tower_training.png.
 
     Returns {"two_tower": {...}, "cold_baselines": {...}} (both merged into metrics["rating_models"])
-    or None if the model is missing. See `cold_baselines` for the two cold-start reference points.
+    or None if the model is missing. See `cold_baselines` for the cold-start reference points.
     Warm candidates = warm items not in the user's train set; cold candidates = cold items only.
     """
     from . import data as data_mod
@@ -400,7 +430,7 @@ def eval_step(cfg, ctx: dict) -> dict | None:
     def score_fn(users):
         return score_users_tt(tt, user_vecs[users])
 
-    batch = getattr(cfg, "eval_rank_batch", 256)
+    batch = cfg.eval_rank_batch
     eval_users = np.asarray(data["eval_users"])
     warm_mask = np.asarray(data["warm_mask"], dtype=bool)
     warm = rank_eval(score_fn, eval_users, data["holdout_test"], data["train_items"], warm_mask, TOP_K, batch)

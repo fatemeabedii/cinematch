@@ -3,7 +3,7 @@
 Users are clustered in cosine geometry (rows of `P` from `cf_mf.npz`, L2-normalised). k is chosen by
 silhouette under a minimum-cluster-size rule and a readability cap (spec 17.2). Each cluster is named
 by the genres its users over-rate in percentage points (spec 17.3) and gets a top-50 recommendation
-list.
+list ranked by `cluster_scores` (MF item bias + weighted centroid taste + popularity prior).
 
 Numpy/pandas only at import time (sklearn and matplotlib are imported lazily; torch is never used).
 """
@@ -99,15 +99,14 @@ def _genre_shares(items: np.ndarray, genre_multi_hot: np.ndarray) -> np.ndarray:
 
 
 def _make_name(genres: list[str], scores: list[float], n: int) -> str:
-    """"A & B fans" (n=2) or "A, B & C fans" (n=3) from the top-scored genres; "Mainstream" when the
-    best genre is over-represented by less than MAINSTREAM_PP percentage points.
-
-    Follows spec 17.3 literally: the 2nd/3rd genre is taken by rank even when its own score is <= 0
-    (e.g. "Comedy & Action fans" where Action is merely the first 0.0 pp genre in ML-1M order).
-    That edge case does not occur on the real data (all named clusters have G2 > 0)."""
+    """"A & B fans" (n=2) or "A, B & C fans" (n=3) from the top-scored genres, keeping only genres
+    with a positive score ("A fans" if only one is); "Mainstream" when the best genre is
+    over-represented by less than MAINSTREAM_PP percentage points."""
     if scores[0] < MAINSTREAM_PP:
         return "Mainstream"
-    picked = genres[:n]
+    picked = [g for g, sc in zip(genres[:n], scores[:n]) if sc > 0]
+    if len(picked) == 1:
+        return f"{picked[0]} fans"
     return f"{', '.join(picked[:-1])} & {picked[-1]} fans"
 
 
@@ -118,7 +117,8 @@ def name_clusters(labels: np.ndarray, ratings_split: pd.DataFrame, movies: pd.Da
     Uses ALL train ratings >= 4 in `ratings_split` (pass only the fit users' rows). For cluster c,
     share_c[g] = fraction of its users' liked ratings whose movie has genre g; share_all[g] = the same
     over every user in `ratings_split`; score = 100 * (share_c - share_all). Name = "G1 & G2 fans" for
-    the top-2 genres by score (ties -> ML-1M genre order), or "Mainstream" if the top score < 2.0 pp.
+    the top-2 genres by score (ties -> ML-1M genre order; only positive scores are named, so it can be
+    "G1 fans"), or "Mainstream" if the top score < 2.0 pp.
     Duplicate names get the 3rd genre ("A, B & C fans"), then a " #<id>" suffix, so names are unique.
     `labels[u]` is the cluster of user index u (`size` counts all of them). `genre_multi_hot` is
     [I, 18] (built from `movies["genres"]` ordered by `i` when None); `n_clusters` defaults to
@@ -165,16 +165,30 @@ def name_clusters(labels: np.ndarray, ratings_split: pd.DataFrame, movies: pd.Da
 
 
 # ----------------------------------------------------------------------------- recs + assignment
-def cluster_recs(centroid_raw: np.ndarray, cf: dict, popularity: dict, warm_mask: np.ndarray,
-                 k: int = 50) -> np.ndarray:
-    """Top-k warm item indices for a cluster: mu + bi + centroid_raw @ Q.T + 0.1 * log1p(count).
+def cluster_scores(centroid_raw: np.ndarray, cf: dict, count: np.ndarray, taste_weight: float,
+                   pop_weight: float) -> np.ndarray:
+    """Taste-profile score of every item [I]:
+    mu + bi + taste_weight * (Q @ centroid_raw) + pop_weight * log1p(count).
 
-    `centroid_raw` is the mean of the members' unnormalised P rows (same scale as Q); `popularity`
-    needs key "count" (train ratings per item). Ties are broken by lower item index.
+    `centroid_raw` is the mean of the members' unnormalised P rows (same scale as Q) and `count` the
+    train ratings per item. With taste_weight = 1 the score is the MF predicted rating of an average
+    member, which is dominated by the item bias (every profile then gets the same "critics' list");
+    the larger taste weight makes lists profile-specific and the popularity term keeps them to films
+    people actually watched. Both weights come from the Config (cluster_taste_weight,
+    cluster_pop_weight). `recommend.Recommender` uses this same function for its display scores.
     """
-    scores = (float(cf["mu"]) + np.asarray(cf["bi"], dtype=np.float64)
-              + np.asarray(cf["Q"], dtype=np.float64) @ np.asarray(centroid_raw, dtype=np.float64)
-              + 0.1 * np.log1p(np.asarray(popularity["count"], dtype=np.float64)))
+    return (float(cf["mu"]) + np.asarray(cf["bi"], dtype=np.float64)
+            + taste_weight * (np.asarray(cf["Q"], dtype=np.float64) @ np.asarray(centroid_raw, dtype=np.float64))
+            + pop_weight * np.log1p(np.asarray(count, dtype=np.float64)))
+
+
+def cluster_recs(centroid_raw: np.ndarray, cf: dict, popularity: dict, warm_mask: np.ndarray,
+                 k: int = 50, *, taste_weight: float, pop_weight: float) -> np.ndarray:
+    """Top-k warm item indices for a cluster, ranked by `cluster_scores`.
+
+    `popularity` needs key "count" (train ratings per item). Ties are broken by lower item index.
+    """
+    scores = cluster_scores(centroid_raw, cf, popularity["count"], taste_weight, pop_weight)
     scores[~np.asarray(warm_mask, dtype=bool)] = -np.inf
     order = np.lexsort((np.arange(len(scores)), -scores))
     order = order[np.isfinite(scores[order])]
@@ -259,7 +273,9 @@ def train_step(cfg, ctx: dict) -> dict:
     warm_mask = data.get("warm_mask")
     if warm_mask is None:
         warm_mask = ~np.asarray(data["item_features"]["is_cold"], dtype=bool)
-    recs = {str(c): [int(x) for x in cluster_recs(centroids_raw[c], cf, popularity, warm_mask, N_RECS)]
+    recs = {str(c): [int(x) for x in cluster_recs(centroids_raw[c], cf, popularity, warm_mask, N_RECS,
+                                                  taste_weight=cfg.cluster_taste_weight,
+                                                  pop_weight=cfg.cluster_pop_weight)]
             for c in range(k)}
 
     pca = PCA(n_components=2, random_state=cfg.seed).fit(X)

@@ -155,7 +155,7 @@ def test_name_clusters_percentage_points_by_hand():
     # Globally: Comedy 2/4, Drama 2/4, Horror 1/4. Cluster 0: Comedy 2/2, Drama 1/2 -> +50, 0, Horror -25.
     assert info[0]["top_genres"][0] == ["Comedy", 50.0]
     assert "Horror" not in dict(info[0]["top_genres"])                    # -25 pp: bottom, not top 5
-    assert info[0]["name"] == "Comedy & Action fans"                      # 2nd = first 0.0 genre in order
+    assert info[0]["name"] == "Comedy fans"                               # 0.0 pp genres are not named
     assert info[1]["top_genres"][0] == ["Horror", 25.0]
     assert info[1]["top_genres"][1] == ["Action", 0.0]
 
@@ -171,7 +171,8 @@ def test_name_clusters_deterministic_and_unique():
     names = [d["name"] for d in a]
     assert names == [d["name"] for d in b]
     assert len(set(names)) == len(names) == 4
-    assert names[0].startswith("Horror, Thriller & ") and names[3].startswith("Horror, Thriller & ")
+    # Both halves get the 3-genre name; a 3rd genre with a score <= 0 is dropped, so one may be shorter.
+    assert all(names[c].startswith(("Horror, Thriller & ", "Horror & Thriller fans")) for c in (0, 3))
 
 
 def test_name_clusters_builds_genres_from_movies_when_missing():
@@ -206,7 +207,7 @@ def test_mainstream_threshold_and_duplicate_mainstream():
     labels = np.array([0] * 10 + [1] * 10 + [2, 3])
     rows = [(u, i, 5.0, "train") for u in range(len(labels)) for i in liked[int(labels[u])]]
     info = clustering.name_clusters(labels, pd.DataFrame(rows, columns=["u", "i", "rating", "split"]), None, genre)
-    assert [d["name"] for d in info] == ["Mainstream #0", "Mainstream #1", "Comedy & Action fans", "Drama & Action fans"]
+    assert [d["name"] for d in info] == ["Mainstream #0", "Mainstream #1", "Comedy fans", "Drama fans"]
     assert info[2]["top_genres"][0][0] == "Comedy" and info[2]["top_genres"][0][1] >= 2.0
     assert info[1]["top_genres"][0] == ["Drama", 1.1]                    # below 2.0 pp -> Mainstream
     assert info[3]["top_genres"][0] == ["Drama", 2.7]                    # above 2.0 pp -> genre name
@@ -231,10 +232,39 @@ def test_cluster_recs_excludes_cold_and_follows_taste():
     data, cf, popularity, _ = _synthetic()
     warm = ~data["item_features"]["is_cold"]
     centroid = cf["P"][:60].mean(axis=0)                                  # cluster-0 taste
-    recs = clustering.cluster_recs(centroid, cf, popularity, warm, k=20)
+    recs = clustering.cluster_recs(centroid, cf, popularity, warm, k=20, taste_weight=2.0, pop_weight=0.5)
     assert len(recs) == 20 and len(set(recs.tolist())) == 20
     assert warm[recs].all()
     assert np.all(recs < 30)                                              # cluster 0's item block
+
+
+def test_cluster_scores_formula_and_weights():
+    """mu + bi + taste_weight * Q @ centroid + pop_weight * log1p(count); the weights change the ranking."""
+    cf = {"mu": np.float32(3.0), "bi": np.array([0.5, 0.0, 0.0], np.float32),
+          "Q": np.array([[0.0, 0.0], [0.4, 0.0], [0.0, 0.0]], np.float32)}
+    count = np.array([1.0, 1.0, 1000.0])
+    centroid = np.array([1.0, 0.0])
+    got = clustering.cluster_scores(centroid, cf, count, taste_weight=2.0, pop_weight=0.5)
+    expected = 3.0 + cf["bi"] + 2.0 * (cf["Q"] @ centroid) + 0.5 * np.log1p(count)
+    assert np.allclose(got, expected)
+    warm = np.ones(3, dtype=bool)
+    pop = {"count": count}
+    # Predicted rating alone (taste 1, no prior) is led by the item bias; taste and popularity reorder it.
+    assert clustering.cluster_recs(centroid, cf, pop, warm, k=3, taste_weight=1.0, pop_weight=0.0)[0] == 0
+    assert clustering.cluster_recs(centroid, cf, pop, warm, k=3, taste_weight=2.0, pop_weight=0.0)[0] == 1
+    assert clustering.cluster_recs(centroid, cf, pop, warm, k=3, taste_weight=2.0, pop_weight=0.5)[0] == 2
+
+
+def test_train_step_recs_use_config_weights(trained):
+    cl = clustering.load_clusters(trained["models_dir"])
+    popularity = {"count": np.full(N_ITEMS, 10.0)}
+    warm = ~trained["data"]["item_features"]["is_cold"]
+    cfg = Config(fast=True)
+    for c in range(cl["k"]):
+        expected = clustering.cluster_recs(cl["centroids_raw"][c], trained["cf"], popularity, warm, k=50,
+                                           taste_weight=cfg.cluster_taste_weight,
+                                           pop_weight=cfg.cluster_pop_weight)
+        assert cl["recs"][str(c)] == expected.tolist()
 
 
 def test_assign_cluster_cosine():

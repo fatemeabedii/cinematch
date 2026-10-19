@@ -4,8 +4,9 @@ Usage (from the repo root):
     python scripts/evaluate.py          # full evaluation
     python scripts/evaluate.py --fast   # smoke mode (README gets a FAST MODE banner)
 
-Each module ``cinematch.<step>`` exposes ``eval_step(cfg, ctx)``; missing modules or
-missing model artifacts leave ``null`` in metrics.json instead of a fake number.
+Each module ``cinematch.<step>`` exposes ``eval_step(cfg, ctx)``; a step whose model
+artifacts are missing returns ``None``, which leaves ``null`` in metrics.json instead of a
+fake number. A missing module or function is an error.
 """
 import _bootstrap  # noqa: F401  (adds src/ to sys.path)
 

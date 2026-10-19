@@ -71,14 +71,14 @@ def test_states_shape_and_content():
 def test_action_masking_never_repeats_a_slot():
     rng = np.random.default_rng(0)
     genres = (rng.random((30, dqn.N_CAND, dqn.N_GENRES)) < 0.2).astype(np.float32)
-    share = dqn.genre_overlap(genres)
+    share, valid = dqn.genre_overlap(genres), np.ones((30, dqn.N_CAND), bool)
     # a Q-function that always prefers the same slots (and random noise) must still give distinct slots
     for q_fn in (lambda s: np.tile(np.arange(dqn.N_CAND, 0, -1, dtype=np.float32), (len(s), 1)),
                  lambda s: rng.normal(size=(len(s), dqn.N_CAND)).astype(np.float32)):
-        orders = dqn.policy_orders(q_fn, genres)
+        orders = dqn.policy_orders(q_fn, genres, valid)
         assert orders.shape == (30, dqn.SESSION_LEN)
         assert all(len(set(row)) == dqn.SESSION_LEN for row in orders.tolist())
-    for orders in (dqn.diversity_orders(share), dqn.random_orders(30, 1), dqn.greedy_cf_orders(30)):
+    for orders in (dqn.diversity_orders(share, valid), dqn.random_orders(30, 1, valid), dqn.greedy_cf_orders(30)):
         assert all(len(set(row)) == dqn.SESSION_LEN for row in orders.tolist())
         assert orders.min() >= 0 and orders.max() < dqn.N_CAND
     assert len(dqn.all_orders()) == 6720
@@ -104,16 +104,16 @@ def test_baselines_on_synthetic_env():
     # equal click probs; slots 0-2 all Action, slots 3-7 each a distinct genre
     p = np.full((1, dqn.N_CAND), 0.5)
     g = _genres([[A], [A], [A], [C], [D], [H], [1], [2]])
-    share = dqn.genre_overlap(g)
+    share, valid = dqn.genre_overlap(g), np.ones((1, dqn.N_CAND), bool)
     assert dqn.greedy_cf_orders(1).tolist() == [[0, 1, 2, 3, 4]]
-    assert dqn.diversity_orders(share).tolist() == [[0, 3, 4, 5, 6]]
+    assert dqn.diversity_orders(share, valid).tolist() == [[0, 3, 4, 5, 6]]
     cfg = _cfg(dqn_position_decay=0.85, dqn_fatigue=0.5)
-    base = dqn.baseline_rewards({"p": p, "share": share}, cfg)
+    base = dqn.baseline_rewards({"p": p, "share": share, "valid": valid}, cfg)
     assert base["diversity_heuristic"] > base["random"] > base["greedy_cf"]
     assert base["oracle"] >= max(base["diversity_heuristic"], base["greedy_cf"], base["random"]) - 1e-12
     # without fatigue the CF order is optimal when p is decreasing
     p2 = np.linspace(0.8, 0.1, dqn.N_CAND)[None]
-    base2 = dqn.baseline_rewards({"p": p2, "share": share}, _cfg(dqn_fatigue=1.0))
+    base2 = dqn.baseline_rewards({"p": p2, "share": share, "valid": valid}, _cfg(dqn_fatigue=1.0))
     assert base2["greedy_cf"] == pytest.approx(base2["oracle"])
 
 
@@ -188,7 +188,8 @@ def test_dqn_learns_genre_aware_order():
     ga = _genres([[A], [A], [A], [C], [D], [H], [1], [2]])
     gb = _genres([[C], [D], [H], [A], [A], [A], [1], [2]])
     genres = np.concatenate([ga, gb] * 10)
-    data = {"p": np.full((20, dqn.N_CAND), 0.9), "genres": genres, "share": dqn.genre_overlap(genres)}
+    data = {"p": np.full((20, dqn.N_CAND), 0.9), "genres": genres, "share": dqn.genre_overlap(genres),
+            "valid": np.ones((20, dqn.N_CAND), bool)}
     cfg = _cfg(dqn_episodes=300, dqn_warmup=32, dqn_batch=32, dqn_fatigue=0.1, dqn_eval_every=50, seed=2)
     net, hist = dqn.train_dqn(data, cfg, log=lambda m: None)
     base = dqn.baseline_rewards(data, cfg)

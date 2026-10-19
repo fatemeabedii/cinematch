@@ -59,7 +59,7 @@ def test_rank_eval_masks_train_items_and_candidates():
         return scores[users]
 
     out = rank_eval(score_fn, np.array([0, 1, 2]), holdout, train_items, mask, k=1, batch=2)
-    assert out == {"precision_at_10": 1.0, "recall_at_10": 1.0, "ndcg_at_10": 1.0, "n_eval_users": 2}
+    assert out == {"precision_at_1": 1.0, "recall_at_1": 1.0, "ndcg_at_1": 1.0, "n_eval_users": 2}  # keys follow k
     assert len(calls) == 2  # batched
     assert scores[0, 0] == 9  # score_fn output is not mutated in place
 
@@ -76,8 +76,8 @@ def test_rank_eval_train_item_never_in_top_k():
     out = rank_eval(lambda us: scores[us], np.arange(n_users), holdout, train_items,
                     np.ones(n_items, dtype=bool), k=5)
     assert out["n_eval_users"] == n_users
-    assert out["precision_at_10"] == pytest.approx(1 / 5)
-    assert out["recall_at_10"] == pytest.approx(1.0) and out["ndcg_at_10"] == pytest.approx(1.0)
+    assert out["precision_at_5"] == pytest.approx(1 / 5)
+    assert out["recall_at_5"] == pytest.approx(1.0) and out["ndcg_at_5"] == pytest.approx(1.0)
 
 
 def test_rank_eval_no_users():

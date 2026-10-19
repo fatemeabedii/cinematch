@@ -250,6 +250,10 @@ def train_step(cfg, ctx: dict) -> dict:
     (+ mean_abs_item_dev) and stored as report["ablation_plus_item_dev"] (spec 18.1).
     Writes models/anomaly.npz, models/anomaly_report.json, models/flagged_users.json and sets
     ctx["flagged_user_ids"]. Returns the anomaly report dict.
+
+    Caveat: features use each user's FULL history (the raw ratings, before the train/val/test
+    split), so the flagged-user filter on the shared eval sample is not strictly blind to the
+    held-out period.
     """
     models_dir = Path(ctx.get("models_dir", MODELS_DIR))
     models_dir.mkdir(parents=True, exist_ok=True)
@@ -449,9 +453,8 @@ def eval_step(cfg, ctx: dict) -> dict | None:
 def load_anomaly(models_dir: Path = MODELS_DIR) -> dict:
     """Numpy-only loader: {"mu","var","eps","feat_mean","feat_std","features"}.
 
-    "features" are the names the model was trained on (stored in the npz). Older files without
-    that key are mapped by length (5 -> FEATURES, 6 -> FEATURES_PLUS); any other length raises.
-    Callers must build the feature vector in model["features"] order (FEATURES for a current model).
+    "features" are the names the model was trained on (stored in the npz); a file without them
+    raises a "retrain" ValueError. Callers must build the feature vector in model["features"] order.
     """
     path = Path(models_dir) / "anomaly.npz"
     if not path.exists():
@@ -459,15 +462,10 @@ def load_anomaly(models_dir: Path = MODELS_DIR) -> dict:
     with np.load(path, allow_pickle=False) as f:
         model = {k: f[k] for k in ("mu", "var", "feat_mean", "feat_std")}
         model["eps"] = float(f["eps"])
-        stored = [str(x) for x in f["features"]] if "features" in f.files else None
-    n = len(np.atleast_1d(model["feat_mean"]))
-    if stored is None:
-        by_len = {len(FEATURES): FEATURES, len(FEATURES_PLUS): FEATURES_PLUS}
-        if n not in by_len:
-            raise ValueError(f"{path} was trained with {n} features (expected {len(FEATURES)}); "
+        if "features" not in f.files:
+            raise ValueError(f"{path} has no stored feature names (outdated artifact); "
                              "retrain with: python scripts/train_all.py")
-        stored = by_len[n]
-    model["features"] = list(stored)
+        model["features"] = [str(x) for x in f["features"]]
     return model
 
 

@@ -266,22 +266,12 @@ def test_train_and_eval_step(tmp_path, monkeypatch):
         anomaly.score_user(model, np.r_[bot_like, 1.4])
 
 
-def test_load_anomaly_legacy_feature_count(tmp_path):
-    """npz files without stored feature names are mapped by length; unknown lengths raise clearly."""
-    def save(d):
-        np.savez(tmp_path / "anomaly.npz", mu=np.zeros(d), var=np.ones(d), eps=np.float64(-5.0),
-                 feat_mean=np.zeros(d), feat_std=np.ones(d))
-    save(5)
-    model = anomaly.load_anomaly(tmp_path)
-    assert model["features"] == anomaly.FEATURES
+def test_load_anomaly_requires_feature_names(tmp_path):
+    """npz files without stored feature names are rejected with a clear 'retrain' message."""
+    d = len(anomaly.FEATURES)
+    np.savez(tmp_path / "anomaly.npz", mu=np.zeros(d), var=np.ones(d), eps=np.float64(-5.0),
+             feat_mean=np.zeros(d), feat_std=np.ones(d))
     with pytest.raises(ValueError, match="retrain"):
-        anomaly.score_user(model, np.zeros(6))
-    save(6)                                   # round-2 artifact (6 features, no stored names)
-    model = anomaly.load_anomaly(tmp_path)
-    assert model["features"] == anomaly.FEATURES_PLUS
-    assert np.isfinite(anomaly.score_user(model, np.zeros(6)))
-    save(4)
-    with pytest.raises(ValueError, match="4 features"):
         anomaly.load_anomaly(tmp_path)
 
 

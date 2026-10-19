@@ -12,6 +12,8 @@ LinUCB on the user context [1, log1p(train count), mean rating, rating std, one_
 LinUCB's alpha and epsilon-greedy's epsilon are tuned (lowest mean cumulative regret over a small
 grid) on a separate simulator built from users DISJOINT from the reported ones (not flagged, not in
 eval_users.npy) with separate seeds; the reported run on eval users then uses the chosen values.
+As a reference (not a learner) the results also report the best single arm chosen in hindsight,
+always pulled on the same user sequences (`best_fixed_arm`).
 
 Module import is numpy-only (the app imports it); `cinematch.recommend` / `cinematch.data` are
 imported lazily inside `train_step`, matplotlib inside `eval_step`. Torch is never used.
@@ -27,6 +29,9 @@ import numpy as np
 from cinematch.config import FIGURES_DIR, MODELS_DIR, PROCESSED_DIR
 
 ARMS = ["cf", "content", "cluster_popular", "trending"]
+# Display name per arm, shared by the app; readme_fill keeps a numpy-free copy (a test checks they match).
+ARM_LABELS = {"cf": "CF", "content": "content", "cluster_popular": "taste-profile favourites",
+              "trending": "trending"}
 LIST_LEN = 10
 CURVE_STEP = 10                     # results curves are subsampled every CURVE_STEP rounds
 POLICY_NAMES = ["random", "epsilon_greedy", "linucb"]
@@ -101,6 +106,19 @@ class RandomPolicy(Policy):
 
     def select(self, x: np.ndarray) -> int:
         return int(self.rng.integers(self.n_arms))
+
+
+class FixedArmPolicy(Policy):
+    """Always the same arm (used for the best-single-arm reference line)."""
+
+    name = "fixed_arm"
+
+    def __init__(self, n_arms: int, rng: np.random.Generator, arm: int):
+        super().__init__(n_arms, rng)
+        self.arm = int(arm)
+
+    def select(self, x: np.ndarray) -> int:
+        return self.arm
 
 
 class EpsilonGreedy(Policy):
@@ -219,15 +237,48 @@ def frac_users_no_signal(expected: np.ndarray) -> float:
     return float(np.mean(expected.max(axis=1) - expected.min(axis=1) < 1e-9))
 
 
+def _aggregate(sims: list[dict], idx: np.ndarray) -> dict:
+    """Mean reward, final cumulative regret mean/std and the subsampled curves over seed runs."""
+    cum_reward = np.cumsum([s["reward"] for s in sims], axis=1)              # [n_seeds, T]
+    cum_regret = np.cumsum([s["regret"] for s in sims], axis=1)
+    return {
+        "mean_reward": round(float(np.mean([s["reward"].mean() for s in sims])), 4),
+        "cum_regret": round(float(cum_regret[:, -1].mean()), 4),
+        "cum_regret_std": round(float(_seed_std(cum_regret[:, -1])), 4),
+        "cum_reward_curve": _r4(cum_reward.mean(axis=0)[idx]),
+        "cum_regret_curve": _r4(cum_regret.mean(axis=0)[idx]),
+        "cum_regret_curve_std": _r4(_seed_std(cum_regret, axis=0)[idx]),
+    }
+
+
+def best_fixed_arm(env_dict: dict, cfg, idx: np.ndarray) -> dict:
+    """Reference: always pull the arm with the highest mean expected reward over the env's users.
+
+    The arm is chosen in HINDSIGHT (from the exact expected rewards no policy can see), so this is
+    not a learner, only a yardstick. It is played on exactly the same per-seed user sequences and
+    click noise as the policies (seed s -> BanditEnv(rng(s))), so its regret is directly comparable.
+    Returns {"arm": name, "mean_reward", "cum_regret", "cum_regret_std"} plus the curves.
+    """
+    expected = np.asarray(env_dict["expected"], dtype=np.float64)
+    arm = int(np.argmax(expected.mean(axis=0)))
+    arm_names = [str(a) for a in env_dict.get("arm_names", ARMS)]
+    sims = [run_simulation(BanditEnv(env_dict, np.random.default_rng(seed)),
+                           FixedArmPolicy(expected.shape[1], np.random.default_rng([seed, 4]), arm),
+                           int(cfg.bandit_rounds))
+            for seed in cfg.bandit_seeds]
+    return {"arm": arm_names[arm], **_aggregate(sims, idx)}
+
+
 def run_all(env_dict: dict, cfg) -> dict:
     """Every policy x every seed in cfg.bandit_seeds for cfg.bandit_rounds rounds.
 
     Seed s gives every policy the same user sequence and click noise. Returns (spec 7.2) per policy
     mean reward, final cumulative regret mean/std over seeds, mean arm counts and mean cumulative
     reward/regret curves (+ regret std), subsampled every CURVE_STEP rounds; plus the oracle mean
-    reward, every arm's mean expected reward over the precomputed users, rounds, n_seeds, the
-    fraction of users with no arm signal and the policy hyperparameters. Stds are sample stds
-    (ddof=1) across seeds.
+    reward, every arm's mean expected reward over the precomputed users, the best single arm in
+    hindsight played on the same sequences (`best_fixed_arm`), rounds, n_seeds, the fraction of
+    users with no arm signal and the policy hyperparameters. Stds are sample stds (ddof=1) across
+    seeds.
     """
     rounds, seeds = int(cfg.bandit_rounds), list(cfg.bandit_seeds)
     n_arms = np.asarray(env_dict["probs"]).shape[1]
@@ -244,23 +295,14 @@ def run_all(env_dict: dict, cfg) -> dict:
     idx = _curve_idx(rounds)
     policies = {}
     for name, sims in runs.items():
-        cum_reward = np.cumsum([s["reward"] for s in sims], axis=1)          # [n_seeds, T]
-        cum_regret = np.cumsum([s["regret"] for s in sims], axis=1)
         counts = np.mean([np.bincount(s["arms"], minlength=n_arms) for s in sims], axis=0)
-        policies[name] = {
-            "mean_reward": round(float(np.mean([s["reward"].mean() for s in sims])), 4),
-            "cum_regret": round(float(cum_regret[:, -1].mean()), 4),
-            "cum_regret_std": round(float(_seed_std(cum_regret[:, -1])), 4),
-            "arm_counts": _r4(counts),
-            "cum_reward_curve": _r4(cum_reward.mean(axis=0)[idx]),
-            "cum_regret_curve": _r4(cum_regret.mean(axis=0)[idx]),
-            "cum_regret_curve_std": _r4(_seed_std(cum_regret, axis=0)[idx]),
-        }
+        policies[name] = {**_aggregate(sims, idx), "arm_counts": _r4(counts)}
     expected = np.asarray(env_dict["expected"], dtype=np.float64)
     return {
         "policies": policies,
         "oracle_mean_reward": round(float(np.mean(oracle_means)), 4),
         "arm_mean_expected_reward": {a: round(float(v), 4) for a, v in zip(arm_names, expected.mean(axis=0))},
+        "best_fixed_arm": best_fixed_arm(env_dict, cfg, idx),
         "rounds": rounds,
         "n_seeds": len(seeds),
         "frac_users_no_signal": round(frac_users_no_signal(expected), 4),
@@ -419,9 +461,13 @@ def _dirs(ctx: dict) -> tuple[Path, Path, Path]:
 
 def _summary(results: dict) -> dict:
     """The metrics.json "bandit" dict: run_all results without the curves."""
+    def drop_curves(d: dict) -> dict:
+        return {k: v for k, v in d.items() if "_curve" not in k}
+
     out = {k: v for k, v in results.items() if k != "policies"}
-    out["policies"] = {name: {k: v for k, v in p.items() if "_curve" not in k}
-                       for name, p in results["policies"].items()}
+    out["policies"] = {name: drop_curves(p) for name, p in results["policies"].items()}
+    if "best_fixed_arm" in results:
+        out["best_fixed_arm"] = drop_curves(results["best_fixed_arm"])
     return out
 
 
@@ -455,7 +501,7 @@ def train_step(cfg, ctx: dict) -> dict:
     recommender = ctx.get("recommender")
     if recommender is None:
         from cinematch.recommend import Recommender
-        recommender = Recommender(models_dir=models_dir, processed_dir=processed_dir)
+        recommender = Recommender(models_dir=models_dir, processed_dir=processed_dir, cfg=cfg)
     data = ctx.get("data") or {}
     holdout = data.get("holdout_test")
     if holdout is None:
@@ -471,7 +517,7 @@ def train_step(cfg, ctx: dict) -> dict:
         user_feat_raw = z["user_feat_raw"]
     with np.load(models_dir / "clusters.npz", allow_pickle=False) as z:
         labels = z["labels"]
-        n_clusters = int(z["centroids"].shape[0]) if "centroids" in z.files else int(labels.max()) + 1
+        n_clusters = int(z["centroids"].shape[0])
 
     def build(users):
         return precompute_env(cfg, recommender, users, holdout, user_feat_raw, labels, n_clusters)
@@ -502,11 +548,15 @@ def train_step(cfg, ctx: dict) -> dict:
     for name, p in results["policies"].items():
         _log(f"{name}: mean reward {p['mean_reward']:.4f}, cum regret {p['cum_regret']:.2f} "
              f"+/- {p['cum_regret_std']:.2f}, arm counts {p['arm_counts']}")
+    fixed = results["best_fixed_arm"]
+    _log(f"best single arm in hindsight ({fixed['arm']}): mean reward {fixed['mean_reward']:.4f}, "
+         f"cum regret {fixed['cum_regret']:.2f} +/- {fixed['cum_regret_std']:.2f}")
     return _summary(results)
 
 
 # ----------------------------------------------------------------------------- evaluation
 POLICY_LABELS = {"random": "Random", "epsilon_greedy": "Epsilon-greedy", "linucb": "LinUCB"}
+FIXED_ARM_LABEL = "best single strategy (hindsight)"
 
 
 def _curve_x(n_points: int, rounds: int) -> np.ndarray:
@@ -515,7 +565,10 @@ def _curve_x(n_points: int, rounds: int) -> np.ndarray:
 
 
 def plot_results(results: dict, figures_dir: Path) -> None:
-    """bandit_cumulative_reward.png (with the oracle's expected line) and bandit_regret.png (± std)."""
+    """bandit_cumulative_reward.png (with the oracle's expected line) and bandit_regret.png (± std).
+
+    Both also draw the best single arm in hindsight (`best_fixed_arm`, if present) as a dashed line.
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -523,11 +576,18 @@ def plot_results(results: dict, figures_dir: Path) -> None:
     figures_dir = Path(figures_dir)
     figures_dir.mkdir(parents=True, exist_ok=True)
     rounds, n_seeds = results["rounds"], results["n_seeds"]
+    fixed = results.get("best_fixed_arm")
+
+    def plot_fixed(ax, key):
+        if fixed and key in fixed:
+            y = np.asarray(fixed[key])
+            ax.plot(_curve_x(len(y), rounds), y, color="gray", ls="--", lw=1.2, label=FIXED_ARM_LABEL)
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for name, p in results["policies"].items():
         y = np.asarray(p["cum_reward_curve"])
         ax.plot(_curve_x(len(y), rounds), y, label=POLICY_LABELS.get(name, name))
+    plot_fixed(ax, "cum_reward_curve")
     ax.plot([0, rounds], [0, rounds * results["oracle_mean_reward"]], "k--", lw=1, label="Oracle (expected)")
     ax.set_xlabel("round")
     ax.set_ylabel("cumulative reward (fraction of 10 items clicked)")
@@ -543,6 +603,7 @@ def plot_results(results: dict, figures_dir: Path) -> None:
         x = _curve_x(len(y), rounds)
         ax.plot(x, y, label=POLICY_LABELS.get(name, name))
         ax.fill_between(x, y - s, y + s, alpha=0.2)
+    plot_fixed(ax, "cum_regret_curve")
     ax.set_xlabel("round")
     ax.set_ylabel("cumulative expected regret")
     ax.set_title(f"Bandit cumulative regret (mean ± std over {n_seeds} seeds)")
