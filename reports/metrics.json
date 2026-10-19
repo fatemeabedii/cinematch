@@ -1,5 +1,5 @@
 {
-  "generated_at": "2026-10-19T15:44:12+00:00",
+  "generated_at": "2026-10-19T15:58:23+00:00",
   "dataset": "MovieLens-1M",
   "split": "per-user time-aware 80/10/10 train/val/test, 6% of movies with >= 20 ratings held out as cold items, seed 42",
   "fast": false,
