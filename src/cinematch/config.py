@@ -80,10 +80,26 @@ class Config:
     bandit_epsilon: float = 0.1
     bandit_alpha: float = 1.0               # LinUCB
     bandit_ridge: float = 1.0
+    bandit_alpha_grid: tuple = (1.0, 0.3, 0.1, 0.03, 0.01)    # LinUCB alpha, tuned on disjoint users
+    bandit_epsilon_grid: tuple = (0.2, 0.1, 0.05, 0.02)       # epsilon-greedy, tuned on disjoint users
+    bandit_tune_users: int = 1000           # tuning users: not flagged, not in eval_users.npy
+    bandit_tune_seeds: tuple = (100, 101)   # disjoint from bandit_seeds
     click_probs: dict = field(default_factory=lambda: {1: 0.02, 2: 0.05, 3: 0.15, 4: 0.45, 5: 0.75})
     click_unrated: float = 0.01
     # dqn (stretch)
-    dqn_episodes: int = 300
+    dqn_episodes: int = 3000                # 5-step sessions; keeps the step well under 90 s
+    dqn_position_decay: float = 0.85        # click prob x decay**t at slot t
+    dqn_fatigue: float = 0.8                # click prob x fatigue**(shown items sharing a genre)
+    dqn_hidden: int = 128
+    dqn_gamma: float = 0.9
+    dqn_lr: float = 1e-3
+    dqn_batch: int = 64
+    dqn_buffer: int = 20000                 # replay capacity (transitions)
+    dqn_warmup: int = 500                   # transitions collected before the first update
+    dqn_target_sync: int = 200              # gradient steps between target-network syncs
+    dqn_eps_end: float = 0.05
+    dqn_eps_decay_frac: float = 0.5         # epsilon 1.0 -> eps_end over this fraction of episodes
+    dqn_eval_every: int = 100               # episodes between greedy-policy checkpoints (curve only)
     # eval
     eval_users: int | None = 2000           # subsample of users for ranking metrics (None = all)
     eval_rank_batch: int = 256
@@ -98,9 +114,12 @@ class Config:
             self.bandit_rounds = 300
             self.bandit_seeds = (0, 1)
             self.bandit_users = 200
+            self.bandit_tune_users = 100
+            self.bandit_tune_seeds = (100,)
             self.eval_users = 300
             self.anomaly_bots_per_type = 20
-            self.dqn_episodes = 20
+            self.dqn_episodes = 200
+            self.dqn_eval_every = 50
 
 
 def get_config(fast: bool | None = None) -> Config:
